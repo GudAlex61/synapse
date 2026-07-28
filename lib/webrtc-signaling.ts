@@ -14,7 +14,7 @@ function parseSignal(value: unknown): RtcSignal | null {
     typeof value.senderId !== "string" ||
     typeof value.recipientId !== "string" ||
     typeof value.sessionId !== "string" ||
-    !["viewer-ready", "offer", "answer", "bye"].includes(String(value.kind)) ||
+    !["viewer-ready", "offer", "answer", "ice-candidate", "bye"].includes(String(value.kind)) ||
     !isRecord(value.payload)
   ) {
     return null

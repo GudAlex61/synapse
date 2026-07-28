@@ -3,6 +3,7 @@ import type { P2PStats } from "./sync-types.ts"
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
 ]
 
 export function parseIceServers(value?: string): RTCIceServer[] {
@@ -12,28 +13,6 @@ export function parseIceServers(value?: string): RTCIceServer[] {
     .map((url) => url.trim())
     .filter((url) => url.startsWith("stun:") || url.startsWith("turn:") || url.startsWith("turns:"))
   return urls.length > 0 ? urls.map((urls) => ({ urls })) : DEFAULT_ICE_SERVERS
-}
-
-export function waitForIceGatheringComplete(
-  connection: RTCPeerConnection,
-  timeoutMs = 10_000,
-): Promise<void> {
-  if (connection.iceGatheringState === "complete") return Promise.resolve()
-  return new Promise((resolve) => {
-    let settled = false
-    const finish = () => {
-      if (settled) return
-      settled = true
-      window.clearTimeout(timeout)
-      connection.removeEventListener("icegatheringstatechange", onChange)
-      resolve()
-    }
-    const onChange = () => {
-      if (connection.iceGatheringState === "complete") finish()
-    }
-    const timeout = window.setTimeout(finish, timeoutMs)
-    connection.addEventListener("icegatheringstatechange", onChange)
-  })
 }
 
 export async function tuneMovieSenders(connection: RTCPeerConnection): Promise<void> {
@@ -60,13 +39,68 @@ export async function tuneMovieSenders(connection: RTCPeerConnection): Promise<v
 
 export function isSessionDescriptionPayload(
   payload: Record<string, unknown>,
-): payload is Record<string, unknown> & { type: RTCSdpType; sdp: string } {
+): payload is Record<string, unknown> & { type: RTCSdpType; sdp: string; negotiationId: string } {
   return (
     (payload.type === "offer" || payload.type === "answer") &&
     typeof payload.sdp === "string" &&
     payload.sdp.length > 0 &&
-    payload.sdp.length <= 500_000
+    payload.sdp.length <= 500_000 &&
+    typeof payload.negotiationId === "string" &&
+    payload.negotiationId.length >= 8 &&
+    payload.negotiationId.length <= 100
   )
+}
+
+export interface IceCandidateSignalPayload {
+  negotiationId: string
+  candidate: RTCIceCandidateInit | null
+}
+
+function isNullableString(value: unknown): value is string | null | undefined {
+  return value === null || value === undefined || typeof value === "string"
+}
+
+function isNullableNumber(value: unknown): value is number | null | undefined {
+  return value === null || value === undefined || (typeof value === "number" && Number.isInteger(value))
+}
+
+export function parseIceCandidatePayload(payload: Record<string, unknown>): IceCandidateSignalPayload | null {
+  if (
+    typeof payload.negotiationId !== "string" ||
+    payload.negotiationId.length < 8 ||
+    payload.negotiationId.length > 100
+  ) {
+    return null
+  }
+  if (payload.candidate === null) {
+    return { negotiationId: payload.negotiationId, candidate: null }
+  }
+  if (typeof payload.candidate !== "object" || payload.candidate === null) return null
+  const candidate = payload.candidate as Record<string, unknown>
+  if (
+    typeof candidate.candidate !== "string" ||
+    candidate.candidate.length > 10_000 ||
+    !isNullableString(candidate.sdpMid) ||
+    !isNullableNumber(candidate.sdpMLineIndex) ||
+    !isNullableString(candidate.usernameFragment)
+  ) {
+    return null
+  }
+  return {
+    negotiationId: payload.negotiationId,
+    candidate: {
+      candidate: candidate.candidate,
+      sdpMid: candidate.sdpMid ?? null,
+      sdpMLineIndex: candidate.sdpMLineIndex ?? null,
+      usernameFragment: candidate.usernameFragment ?? null,
+    },
+  }
+}
+
+export function getIceCandidateType(candidate: RTCIceCandidateInit | null): string | null {
+  if (!candidate?.candidate) return null
+  const match = candidate.candidate.match(/\btyp\s+(host|srflx|prflx|relay)\b/i)
+  return match?.[1]?.toLowerCase() ?? null
 }
 
 export async function readConnectionStats(

@@ -85,7 +85,7 @@ export interface Peer {
   onlineAt: number
 }
 
-export type RtcSignalKind = "viewer-ready" | "offer" | "answer" | "bye"
+export type RtcSignalKind = "viewer-ready" | "offer" | "answer" | "ice-candidate" | "bye"
 
 export interface RtcSignal {
   id: number
