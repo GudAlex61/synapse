@@ -21,7 +21,7 @@ export function getSupabasePublicConfig(): SupabasePublicConfig {
   return { url: url.replace(/\/$/, ""), anonKey }
 }
 
-// Singleton browser client. It is shared by Realtime, database RPC calls and Storage.
+// Singleton browser client shared by Realtime and database RPC calls.
 export function createClient() {
   if (client) return client
   const { url, anonKey } = getSupabasePublicConfig()

@@ -17,6 +17,15 @@ function cacheKey(roomId: string) {
   return `${CACHE_PREFIX}${roomId}`
 }
 
+export function clearCachedSnapshot(roomId: string): void {
+  if (typeof window === "undefined") return
+  try {
+    window.localStorage.removeItem(cacheKey(roomId))
+  } catch {
+    // Best effort.
+  }
+}
+
 export function loadCachedSnapshot(roomId: string): RoomSnapshot {
   if (typeof window === "undefined") return { state: null, messages: [] }
   try {
@@ -76,12 +85,42 @@ export async function persistRoomState(
     p_playing: state.playing,
     p_updated_by: state.updatedBy,
     p_client_updated_at: state.updatedAt,
+    p_revision_counter: state.revision.counter,
+    p_revision_sender: state.revision.senderId,
   })
   if (error) throw new Error(error.message)
 }
 
-export async function removeStoredVideo(storagePath: string): Promise<void> {
+export async function touchRoomMember(roomId: string, memberId: string): Promise<void> {
   const supabase = createClient()
-  const { error } = await supabase.storage.from("room-videos").remove([storagePath])
+  const { error } = await supabase.rpc("touch_watch_room_member", {
+    p_room_id: roomId,
+    p_member_id: memberId,
+  })
   if (error) throw new Error(error.message)
+}
+
+export async function leaveRoom(roomId: string, memberId: string): Promise<void> {
+  const response = await fetch("/api/rooms/leave", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ roomId, memberId }),
+  })
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error || `Could not leave room (${response.status}).`)
+  }
+}
+
+export function leaveRoomKeepalive(roomId: string, memberId: string): void {
+  try {
+    void fetch("/api/rooms/leave", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ roomId, memberId }),
+      keepalive: true,
+    }).catch(() => undefined)
+  } catch {
+    // Best effort during page shutdown.
+  }
 }
