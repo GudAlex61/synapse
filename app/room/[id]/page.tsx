@@ -14,5 +14,6 @@ export default async function RoomPage({
   const roomId = normalizeRoomCode(id)
   if (!isValidRoomCode(roomId)) notFound()
 
+  // Keep backward compatibility with old invite links containing ?name=.
   return <RoomGate roomId={roomId} initialName={name ?? ""} />
 }

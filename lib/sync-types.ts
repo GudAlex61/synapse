@@ -1,4 +1,4 @@
-// Shared types for the realtime protocol.
+// Shared types for the realtime protocol and persisted room snapshot.
 
 export type PlayerAction = "play" | "pause" | "seek" | "buffer" | "resume"
 
@@ -6,7 +6,7 @@ export interface PlayerEvent {
   action: PlayerAction
   // Position in the video (seconds) at the moment the sender emitted the event.
   videoTime: number
-  // Sender wall-clock time (ms). Used to compensate for network latency.
+  // Sender wall-clock time (ms). Used to compensate for network latency while playing.
   at: number
   senderId: string
 }
@@ -19,12 +19,15 @@ export interface ChatEvent {
   at: number
 }
 
+export type SourceKind = "url" | "storage" | "uploading"
+
 export interface SourceInfo {
-  // "url" sources can be auto-loaded by the peer. "file" sources cannot be
-  // transferred, so the peer is asked to pick the same file locally.
-  kind: "url" | "file"
-  label: string // url string or file name
-  url?: string // only present for kind === "url"
+  // URL sources are loaded directly. Storage sources are uploaded local files
+  // with a public playback URL. "uploading" is a temporary realtime hint.
+  kind: SourceKind
+  label: string
+  url?: string
+  storagePath?: string
   duration: number | null
   senderId: string
 }
@@ -32,15 +35,29 @@ export interface SourceInfo {
 // Shared "current state" payload, used for two purposes:
 //  - reason "join": one-time reply to a newcomer's state-request (full resync)
 //  - reason "heartbeat": periodic drift-correction from the timekeeper
+//  - reason "source": immediate playback state after changing a source
 export interface StateResponse {
   source: SourceInfo | null
   videoTime: number
   playing: boolean
   at: number
   senderId: string
-  reason: "join" | "heartbeat"
+  reason: "join" | "heartbeat" | "source"
   // Only set for "join": the id of the newcomer this reply is meant for.
   toId?: string
+}
+
+export interface PersistedRoomState {
+  source: SourceInfo | null
+  videoTime: number
+  playing: boolean
+  updatedAt: number
+  updatedBy: string
+}
+
+export interface RoomSnapshot {
+  state: PersistedRoomState | null
+  messages: ChatEvent[]
 }
 
 export type SystemMessage = {

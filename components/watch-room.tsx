@@ -2,21 +2,40 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
-import { AlertTriangle, ArrowLeft, Copy, Check, Users } from "lucide-react"
+import { AlertTriangle, ArrowLeft, Check, Copy, Users } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { VideoPlayer, type VideoPlayerHandle } from "@/components/video-player"
 import { Chat } from "@/components/chat"
 import { SourceControls } from "@/components/source-controls"
 import { useRoomChannel } from "@/hooks/use-room-channel"
-import type { ChatItem, SourceInfo } from "@/lib/sync-types"
+import {
+  dedupeMessages,
+  loadCachedSnapshot,
+  loadRemoteSnapshot,
+  mergeSnapshots,
+  persistRoomMessage,
+  persistRoomState,
+  removeStoredVideo,
+  saveCachedSnapshot,
+} from "@/lib/room-store"
+import { normalizeVideoUrl } from "@/lib/room"
+import { uploadRoomVideo } from "@/lib/storage-upload"
+import type {
+  ChatEvent,
+  ChatItem,
+  PersistedRoomState,
+  SourceInfo,
+} from "@/lib/sync-types"
 
-// If our clock says playback should differ from the timekeeper by more than
-// this many seconds, we hard-correct via seek.
 const DRIFT_THRESHOLD = 1
 const HEARTBEAT_MS = 4000
-// After we programmatically drive the player, ignore its own events for this
-// long so we don't rebroadcast (echo) the action back to our partner.
-const ECHO_WINDOW_MS = 600
+const ECHO_WINDOW_MS = 700
+const RESTORE_ADVANCE_CAP_SECONDS = 15
+
+function sourceKey(source: SourceInfo | null): string {
+  if (!source) return "none"
+  return `${source.kind}:${source.storagePath ?? source.url ?? source.label}`
+}
 
 export function WatchRoom({ roomId, userName }: { roomId: string; userName: string }) {
   const router = useRouter()
@@ -25,102 +44,257 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
   const [chatItems, setChatItems] = useState<ChatItem[]>([])
   const [src, setSrc] = useState<string | null>(null)
   const [myDuration, setMyDuration] = useState<number | null>(null)
+  const myDurationRef = useRef<number | null>(null)
   const [partnerSource, setPartnerSource] = useState<SourceInfo | null>(null)
   const [hint, setHint] = useState<string | null>(null)
   const [videoError, setVideoError] = useState<string | null>(null)
+  const [persistenceError, setPersistenceError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
 
-  const applyingRemote = useRef(false)
+  const suppressEventsUntil = useRef(0)
   const buffering = useRef(false)
   const mySourceRef = useRef<SourceInfo | null>(null)
   const srcRef = useRef<string | null>(null)
+  const objectUrlRef = useRef<string | null>(null)
+  const messagesRef = useRef<ChatEvent[]>([])
+  const latestStateRef = useRef<PersistedRoomState | null>(null)
+  const latestAppliedStateAt = useRef(0)
+  const pendingRestoreRef = useRef<PersistedRoomState | null>(null)
+  const uploadControllerRef = useRef<AbortController | null>(null)
+  const uploadTokenRef = useRef(0)
+  const pendingPersistRef = useRef<PersistedRoomState | null>(null)
+  const persistenceRunningRef = useRef(false)
+  const announcedSourceRef = useRef("")
+  const channelRef = useRef<ReturnType<typeof useRoomChannel> | null>(null)
   srcRef.current = src
 
+  const cacheSnapshot = useCallback(
+    (state = latestStateRef.current, messages = messagesRef.current) => {
+      saveCachedSnapshot(roomId, { state, messages })
+    },
+    [roomId],
+  )
+
+  const setChatMessages = useCallback(
+    (messages: ChatEvent[]) => {
+      const deduped = dedupeMessages(messages).slice(-500)
+      messagesRef.current = deduped
+      setChatItems((previous) => {
+        const system = previous.filter((item) => item.kind === "system")
+        return [...system, ...deduped.map((message) => ({ kind: "chat" as const, ...message }))].sort(
+          (a, b) => a.at - b.at,
+        )
+      })
+      cacheSnapshot(latestStateRef.current, deduped)
+    },
+    [cacheSnapshot],
+  )
+
+  const appendChat = useCallback(
+    (message: ChatEvent) => {
+      setChatMessages([...messagesRef.current, message])
+    },
+    [setChatMessages],
+  )
+
   const pushSystem = useCallback((text: string) => {
-    setChatItems((prev) => [
-      ...prev,
+    setChatItems((previous) => [
+      ...previous,
       { kind: "system", id: crypto.randomUUID(), text, at: Date.now() },
     ])
   }, [])
 
-  // Run `fn` as a "remote-driven" action so our own player events are not
-  // echoed back over the channel.
+  const replaceSourceUrl = useCallback((nextSrc: string | null, objectUrl: string | null = null) => {
+    if (objectUrlRef.current && objectUrlRef.current !== objectUrl) {
+      URL.revokeObjectURL(objectUrlRef.current)
+    }
+    objectUrlRef.current = objectUrl
+    setSrc(nextSrc)
+  }, [])
+
   const withRemote = useCallback((fn: () => void) => {
-    applyingRemote.current = true
+    suppressEventsUntil.current = Math.max(suppressEventsUntil.current, Date.now() + ECHO_WINDOW_MS)
     fn()
-    window.setTimeout(() => {
-      applyingRemote.current = false
-    }, ECHO_WINDOW_MS)
   }, [])
 
-  const loadUrl = useCallback((url: string) => {
-    setVideoError(null)
-    setHint(null)
-    setMyDuration(null)
-    setSrc(url)
-    mySourceRef.current = { kind: "url", label: url, url, duration: null, senderId: "" }
-    return mySourceRef.current
-  }, [])
+  const isRemoteEventSuppressed = () => Date.now() < suppressEventsUntil.current
 
-  const loadFile = useCallback((file: File) => {
-    setVideoError(null)
-    setHint(null)
-    setMyDuration(null)
-    const objectUrl = URL.createObjectURL(file)
-    setSrc(objectUrl)
-    mySourceRef.current = { kind: "file", label: file.name, duration: null, senderId: "" }
-    return mySourceRef.current
-  }, [])
+  const restorePlayback = useCallback(
+    (state: PersistedRoomState) => {
+      const player = playerRef.current
+      if (!player || !srcRef.current || player.getDuration() <= 0) {
+        pendingRestoreRef.current = state
+        return false
+      }
 
-  // ---- Realtime channel ----------------------------------------------------
+      pendingRestoreRef.current = null
+      const elapsed = state.playing
+        ? Math.min(
+            RESTORE_ADVANCE_CAP_SECONDS,
+            Math.max(0, (Date.now() - state.updatedAt) / 1000),
+          )
+        : 0
+      withRemote(() => {
+        player.seek(state.videoTime + elapsed)
+        if (state.playing) void player.play()
+        else player.pause()
+      })
+      return true
+    },
+    [withRemote],
+  )
+
+  const queuePersistState = useCallback(
+    (state: PersistedRoomState) => {
+      latestStateRef.current = state
+      pendingPersistRef.current = state
+      cacheSnapshot(state)
+
+      if (persistenceRunningRef.current) return
+      persistenceRunningRef.current = true
+
+      void (async () => {
+        while (pendingPersistRef.current) {
+          const next = pendingPersistRef.current
+          pendingPersistRef.current = null
+          try {
+            await persistRoomState(roomId, next)
+            setPersistenceError(null)
+          } catch (error) {
+            setPersistenceError(
+              error instanceof Error
+                ? `Room history is only saved on this device: ${error.message}`
+                : "Room history is only saved on this device.",
+            )
+          }
+        }
+        persistenceRunningRef.current = false
+      })()
+    },
+    [cacheSnapshot, roomId],
+  )
+
+  const currentState = useCallback(
+    (overrides: Partial<Pick<PersistedRoomState, "source" | "videoTime" | "playing">> = {}) => {
+      const player = playerRef.current
+      return {
+        source: overrides.source === undefined ? mySourceRef.current : overrides.source,
+        videoTime:
+          overrides.videoTime === undefined ? Math.max(0, player?.getTime() ?? 0) : overrides.videoTime,
+        playing:
+          overrides.playing === undefined ? Boolean(player && !player.isPaused()) : overrides.playing,
+        updatedAt: Date.now(),
+        updatedBy: channelRef.current?.myId ?? "",
+      } satisfies PersistedRoomState
+    },
+    [],
+  )
+
+  const loadSharedSource = useCallback(
+    (source: SourceInfo, restore?: PersistedRoomState | null) => {
+      if ((source.kind === "url" || source.kind === "storage") && source.url) {
+        buffering.current = false
+        setVideoError(null)
+        setHint(null)
+        setMyDuration(null)
+        myDurationRef.current = null
+        mySourceRef.current = source
+        replaceSourceUrl(source.url)
+        if (restore) pendingRestoreRef.current = restore
+      } else if (source.kind === "uploading") {
+        setPartnerSource(source)
+        setHint(`Your partner is uploading “${source.label}”. It will open automatically when ready.`)
+      }
+    },
+    [replaceSourceUrl],
+  )
+
+  const applyPersistedState = useCallback(
+    (state: PersistedRoomState | null) => {
+      if (!state || state.updatedAt < latestAppliedStateAt.current) return
+      latestAppliedStateAt.current = state.updatedAt
+      latestStateRef.current = state
+
+      if (state.source && sourceKey(state.source) !== sourceKey(mySourceRef.current)) {
+        loadSharedSource(state.source, state)
+      } else if (state.source) {
+        restorePlayback(state)
+      }
+      cacheSnapshot(state)
+    },
+    [cacheSnapshot, loadSharedSource, restorePlayback],
+  )
+
   const channel = useRoomChannel({
     roomId,
     userName,
     handlers: {
       onSystem: pushSystem,
-      onChat: (e) => setChatItems((prev) => [...prev, { kind: "chat", ...e }]),
+      onChat: (message) => {
+        appendChat(message)
+        void persistRoomMessage(roomId, message).catch(() => undefined)
+      },
       onSource: (info) => {
         setPartnerSource(info)
-        pushSystem(`Partner loaded "${info.label}"`)
-        if (!srcRef.current && info.kind === "url" && info.url) {
-          loadUrl(info.url)
-        } else if (!srcRef.current && info.kind === "file") {
-          setHint(`Partner is watching "${info.label}". Choose the same file to sync.`)
+        const key = sourceKey(info)
+        if (announcedSourceRef.current !== key) {
+          announcedSourceRef.current = key
+          pushSystem(
+            info.kind === "uploading"
+              ? `Partner is uploading “${info.label}”`
+              : `Partner loaded “${info.label}”`,
+          )
         }
+
+        if (info.kind === "uploading") {
+          setHint(`Your partner is uploading “${info.label}”. It will open automatically when ready.`)
+          return
+        }
+
+        uploadTokenRef.current += 1
+        uploadControllerRef.current?.abort()
+        uploadControllerRef.current = null
+        setUploading(false)
+        loadSharedSource(info)
+        const state = currentState({ source: info, videoTime: 0, playing: false })
+        latestStateRef.current = state
+        cacheSnapshot(state)
       },
-      onPlayer: (e) => {
+      onPlayer: (event) => {
         const player = playerRef.current
-        if (!player) return
-        const delay = (Date.now() - e.at) / 1000
-        switch (e.action) {
+        if (!player || !srcRef.current) return
+        const delay = Math.max(0, (Date.now() - event.at) / 1000)
+
+        switch (event.action) {
           case "play":
           case "resume":
             withRemote(() => {
-              player.seek(e.videoTime + Math.max(0, delay))
+              player.seek(event.videoTime + delay)
               void player.play()
             })
             break
           case "pause":
             withRemote(() => {
-              player.seek(e.videoTime)
+              player.seek(event.videoTime)
               player.pause()
             })
             break
           case "buffer":
-            // Partner is buffering — hold here until they resume.
             withRemote(() => player.pause())
             break
           case "seek":
-            withRemote(() => player.seek(e.videoTime + Math.max(0, delay)))
+            // A seek is an absolute position; network delay must not be added.
+            withRemote(() => player.seek(event.videoTime))
             break
         }
       },
       onStateRequest: (fromId) => {
-        // Someone joined and asked for the current state. Only respond if we
-        // actually have a video loaded.
+        const api = channelRef.current
         const player = playerRef.current
-        if (!srcRef.current || !player) return
-        channel.sendState({
+        if (!api || !mySourceRef.current || mySourceRef.current.kind === "uploading" || !player) return
+        api.sendState({
           source: mySourceRef.current,
           videoTime: player.getTime(),
           playing: !player.isPaused(),
@@ -128,46 +302,50 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
           toId: fromId,
         })
       },
-      onStateResponse: (res) => {
-        setPartnerSource(res.source)
-        const player = playerRef.current
+      onStateResponse: (response) => {
+        const api = channelRef.current
+        if (!api) return
+        setPartnerSource(response.source)
 
-        if (res.reason === "join") {
-          if (res.toId !== channel.myId) return
-          // Full resync to the existing member.
-          if (!srcRef.current && res.source) {
-            if (res.source.kind === "url" && res.source.url) loadUrl(res.source.url)
-            else if (res.source.kind === "file") {
-              setHint(`Partner is watching "${res.source.label}". Choose the same file to sync.`)
-            }
-          }
-          if (player && srcRef.current) {
-            const expected = res.videoTime + (res.playing ? (Date.now() - res.at) / 1000 : 0)
-            withRemote(() => {
-              player.seek(expected)
-              if (res.playing) void player.play()
-              else player.pause()
-            })
-          }
+        if (response.reason === "join" && response.toId !== api.myId) return
+        if (response.reason === "heartbeat" && api.myId === timekeeperIdRef.current) return
+
+        const responseState: PersistedRoomState = {
+          source: response.source,
+          videoTime: response.videoTime,
+          playing: response.playing,
+          updatedAt: response.at,
+          updatedBy: response.senderId,
+        }
+
+        if (response.source && sourceKey(response.source) !== sourceKey(mySourceRef.current)) {
+          loadSharedSource(response.source, responseState)
           return
         }
 
-        // reason === "heartbeat": only the follower corrects drift.
+        const player = playerRef.current
         if (!player || !srcRef.current) return
-        if (channel.myId === timekeeperIdRef.current) return
-        const expected = res.videoTime + (res.playing ? (Date.now() - res.at) / 1000 : 0)
+        const expected =
+          response.videoTime +
+          (response.playing ? Math.max(0, (Date.now() - response.at) / 1000) : 0)
         const mine = player.getTime()
-        if (Math.abs(expected - mine) > DRIFT_THRESHOLD) {
-          withRemote(() => player.seek(expected))
-        }
-        if (res.playing && player.isPaused()) withRemote(() => void player.play())
-        if (!res.playing && !player.isPaused()) withRemote(() => player.pause())
+
+        withRemote(() => {
+          if (
+            response.reason === "join" ||
+            response.reason === "source" ||
+            Math.abs(expected - mine) > DRIFT_THRESHOLD
+          ) {
+            player.seek(expected)
+          }
+          if (response.playing) void player.play()
+          else player.pause()
+        })
       },
     },
   })
+  channelRef.current = channel
 
-  // Deterministic timekeeper: the participant with the smaller id owns the
-  // heartbeat; the other one follows and corrects drift.
   const timekeeperId = useMemo(() => {
     if (!channel.partner) return channel.myId
     return [channel.myId, channel.partner.id].sort()[0]
@@ -175,46 +353,224 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
   const timekeeperIdRef = useRef(timekeeperId)
   timekeeperIdRef.current = timekeeperId
 
-  // Heartbeat: timekeeper broadcasts its position periodically.
+  // Restore cached data immediately, then merge the authoritative Supabase snapshot.
   useEffect(() => {
-    if (!channel.partner) return
+    let active = true
+    const cached = loadCachedSnapshot(roomId)
+    setChatMessages(cached.messages)
+    applyPersistedState(cached.state)
+
+    void loadRemoteSnapshot(roomId)
+      .then((remote) => {
+        if (!active) return
+        const merged = mergeSnapshots(cached, remote)
+        saveCachedSnapshot(roomId, merged)
+        setChatMessages(merged.messages)
+        applyPersistedState(merged.state)
+        setPersistenceError(null)
+      })
+      .catch((error) => {
+        if (!active) return
+        setPersistenceError(
+          error instanceof Error
+            ? `Supabase persistence is unavailable: ${error.message}. Apply the included migration.`
+            : "Supabase persistence is unavailable. Apply the included migration.",
+        )
+      })
+
+    return () => {
+      active = false
+    }
+  }, [applyPersistedState, roomId, setChatMessages])
+
+  // Heartbeat: one deterministic participant owns clock correction and persistence.
+  useEffect(() => {
+    if (!channel.partner || channel.myId !== timekeeperId) return
     const interval = window.setInterval(() => {
       const player = playerRef.current
-      if (!player || !srcRef.current) return
-      if (channel.myId !== timekeeperIdRef.current) return
+      if (!player || !mySourceRef.current || mySourceRef.current.kind === "uploading") return
+      const state = currentState()
       channel.sendState({
-        source: mySourceRef.current,
-        videoTime: player.getTime(),
-        playing: !player.isPaused(),
+        source: state.source,
+        videoTime: state.videoTime,
+        playing: state.playing,
         reason: "heartbeat",
       })
+      queuePersistState(state)
     }, HEARTBEAT_MS)
     return () => window.clearInterval(interval)
-  }, [channel])
+  }, [channel.myId, channel.partner, channel.sendState, currentState, queuePersistState, timekeeperId])
 
-  // ---- Local player event handlers ----------------------------------------
-  const guard = (fn: () => void) => {
-    if (applyingRemote.current) return
-    fn()
-  }
+  // Always keep a synchronous local snapshot on refresh/navigation.
+  useEffect(() => {
+    const save = () => {
+      if (
+        mySourceRef.current &&
+        mySourceRef.current.kind !== "uploading" &&
+        playerRef.current
+      ) {
+        const state = currentState()
+        latestStateRef.current = state
+      }
+      cacheSnapshot()
+    }
+    window.addEventListener("pagehide", save)
+    return () => window.removeEventListener("pagehide", save)
+  }, [cacheSnapshot, currentState])
 
-  const broadcastSource = useCallback(
-    (info: SourceInfo, duration: number | null) => {
-      channel.sendSource({ ...info, duration })
+  useEffect(
+    () => () => {
+      uploadControllerRef.current?.abort()
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
     },
-    [channel],
+    [],
   )
 
-  const onUrl = (url: string) => {
-    const info = loadUrl(url)
-    broadcastSource(info, null)
-  }
-  const onFile = (file: File) => {
-    const info = loadFile(file)
-    broadcastSource(info, null)
+  const broadcastAndPersistSource = useCallback(
+    (source: Omit<SourceInfo, "senderId">, videoTime = 0, playing = false) => {
+      const shared = channel.sendSource(source)
+      mySourceRef.current = shared
+      const state = currentState({ source: shared, videoTime, playing })
+      channel.sendState({
+        source: shared,
+        videoTime,
+        playing,
+        reason: "source",
+      })
+      queuePersistState(state)
+      return shared
+    },
+    [channel, currentState, queuePersistState],
+  )
+
+  const handleUrl = useCallback(
+    (input: string) => {
+      const url = normalizeVideoUrl(input)
+      if (!url) {
+        setVideoError("Enter a valid http:// or https:// video URL.")
+        return
+      }
+
+      uploadTokenRef.current += 1
+      uploadControllerRef.current?.abort()
+      uploadControllerRef.current = null
+      setUploading(false)
+      buffering.current = false
+      setVideoError(null)
+      setHint(null)
+      setMyDuration(null)
+      myDurationRef.current = null
+      replaceSourceUrl(url)
+      broadcastAndPersistSource({
+        kind: "url",
+        label: url,
+        url,
+        duration: null,
+      })
+    },
+    [broadcastAndPersistSource, replaceSourceUrl],
+  )
+
+  const handleFile = useCallback(
+    (file: File) => {
+      uploadTokenRef.current += 1
+      const token = uploadTokenRef.current
+      uploadControllerRef.current?.abort()
+      const controller = new AbortController()
+      uploadControllerRef.current = controller
+
+      buffering.current = false
+      setVideoError(null)
+      setHint("The video is available locally now and is being uploaded for your partner.")
+      setMyDuration(null)
+      myDurationRef.current = null
+      setUploadProgress(0)
+      setUploading(true)
+
+      const objectUrl = URL.createObjectURL(file)
+      replaceSourceUrl(objectUrl, objectUrl)
+      const temporary = channel.sendSource({
+        kind: "uploading",
+        label: file.name,
+        duration: null,
+      })
+      mySourceRef.current = temporary
+
+      const previousStoragePath =
+        latestStateRef.current?.source?.kind === "storage"
+          ? latestStateRef.current.source.storagePath
+          : undefined
+
+      void uploadRoomVideo({
+        roomId,
+        file,
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (uploadTokenRef.current === token) setUploadProgress(progress)
+        },
+      })
+        .then(({ publicUrl, storagePath }) => {
+          if (uploadTokenRef.current !== token) return
+          uploadControllerRef.current = null
+          setUploading(false)
+          setUploadProgress(100)
+          setHint("Upload complete. Your partner can now stream the same video.")
+
+          const player = playerRef.current
+          const shared = broadcastAndPersistSource(
+            {
+              kind: "storage",
+              label: file.name,
+              url: publicUrl,
+              storagePath,
+              duration: myDurationRef.current,
+            },
+            player?.getTime() ?? 0,
+            Boolean(player && !player.isPaused()),
+          )
+
+          mySourceRef.current = shared
+          if (previousStoragePath && previousStoragePath !== storagePath) {
+            void removeStoredVideo(previousStoragePath).catch(() => undefined)
+          }
+        })
+        .catch((error) => {
+          if (uploadTokenRef.current !== token) return
+          uploadControllerRef.current = null
+          setUploading(false)
+          if (error instanceof DOMException && error.name === "AbortError") {
+            setHint("Upload cancelled. This local file is not available to your partner.")
+            return
+          }
+          setVideoError(error instanceof Error ? error.message : "Could not upload this video.")
+          setHint("The file still plays on this device, but it was not shared with your partner.")
+        })
+    },
+    [broadcastAndPersistSource, channel, replaceSourceUrl, roomId],
+  )
+
+  const cancelUpload = useCallback(() => {
+    uploadTokenRef.current += 1
+    uploadControllerRef.current?.abort()
+    uploadControllerRef.current = null
+    setUploading(false)
+    setHint("Upload cancelled. This local file is not available to your partner.")
+  }, [])
+
+  const guard = (fn: () => void) => {
+    if (!isRemoteEventSuppressed()) fn()
   }
 
-  // ---- Derived UI state ----------------------------------------------------
+  const broadcastPlayerState = (action: "play" | "pause" | "seek" | "buffer" | "resume") => {
+    const player = playerRef.current
+    if (!player) return
+    if (mySourceRef.current?.kind === "uploading") return
+    channel.sendPlayer({ action, videoTime: player.getTime() })
+    if (mySourceRef.current && action !== "buffer") {
+      queuePersistState(currentState({ playing: action === "play" || action === "resume" }))
+    }
+  }
+
   const mismatch =
     myDuration != null &&
     partnerSource?.duration != null &&
@@ -226,7 +582,7 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1500)
     } catch {
-      /* clipboard unavailable */
+      setPersistenceError("Could not copy the room code. Select it manually.")
     }
   }
 
@@ -248,7 +604,6 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
 
   return (
     <main className="mx-auto flex min-h-dvh max-w-6xl flex-col gap-4 px-4 py-4 lg:px-6">
-      {/* Header */}
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="icon" onClick={() => router.push("/")} aria-label="Leave room">
@@ -259,6 +614,7 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
             <button
               onClick={copyCode}
               className="flex items-center gap-2 font-mono text-lg font-semibold tracking-widest text-foreground"
+              aria-label={`Copy room code ${roomId}`}
             >
               {roomId}
               {copied ? (
@@ -272,74 +628,81 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
 
         <StatusPill
           status={channel.status}
-          hasPartner={!!channel.partner}
+          hasPartner={Boolean(channel.partner)}
           partnerName={channel.partner?.name}
         />
       </header>
 
-      {/* Banners */}
       {mismatch && (
         <Banner tone="warning">
-          The two video files look different (durations don&apos;t match), so playback may drift.
-          Make sure you both loaded the same file.
+          The two video files have different durations. Make sure both participants use the same file.
         </Banner>
       )}
       {videoError && <Banner tone="error">{videoError}</Banner>}
-      {!channel.partner && channel.status !== "connecting" && (
+      {persistenceError && <Banner tone="warning">{persistenceError}</Banner>}
+      {channel.connectionError && <Banner tone="error">{channel.connectionError}</Banner>}
+      {!channel.partner && channel.status === "connected" && (
         <Banner tone="info">
-          Waiting for your partner to join — share the room code <strong>{roomId}</strong> with them.
+          Waiting for your partner — share room code <strong>{roomId}</strong>.
         </Banner>
       )}
-      {channel.status === "reconnecting" && (
-        <Banner tone="info">Reconnecting…</Banner>
-      )}
+      {channel.status === "reconnecting" && <Banner tone="info">Reconnecting…</Banner>}
 
-      {/* Content */}
       <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_340px]">
         <div className="flex flex-col gap-4">
           <VideoPlayer
             ref={playerRef}
             src={src}
-            onLoadedMetadata={(duration) => {
+            onLoadedMetadata={(duration: number | null) => {
               setMyDuration(duration)
+              myDurationRef.current = duration
               if (mySourceRef.current) {
                 mySourceRef.current = { ...mySourceRef.current, duration }
-                broadcastSource(mySourceRef.current, duration)
+              }
+
+              const restore = pendingRestoreRef.current
+              if (restore) restorePlayback(restore)
+
+              const source = mySourceRef.current
+              if (source && source.kind !== "uploading") {
+                const shared = channel.sendSource({
+                  ...source,
+                  duration,
+                })
+                mySourceRef.current = shared
+                queuePersistState(currentState({ source: shared }))
               }
             }}
-            onError={(msg) => setVideoError(msg)}
-            onPlay={() =>
-              guard(() =>
-                channel.sendPlayer({ action: "play", videoTime: playerRef.current?.getTime() ?? 0 }),
-              )
-            }
+            onError={(message: string) => setVideoError(message)}
+            onPlay={() => guard(() => broadcastPlayerState("play"))}
             onPause={() =>
               guard(() => {
-                if (buffering.current) return
-                channel.sendPlayer({ action: "pause", videoTime: playerRef.current?.getTime() ?? 0 })
+                if (!buffering.current) broadcastPlayerState("pause")
               })
             }
-            onSeeked={() =>
-              guard(() =>
-                channel.sendPlayer({ action: "seek", videoTime: playerRef.current?.getTime() ?? 0 }),
-              )
-            }
+            onSeeked={() => guard(() => broadcastPlayerState("seek"))}
             onWaiting={() =>
               guard(() => {
                 buffering.current = true
-                channel.sendPlayer({ action: "buffer", videoTime: playerRef.current?.getTime() ?? 0 })
+                broadcastPlayerState("buffer")
               })
             }
             onPlaying={() =>
               guard(() => {
                 if (!buffering.current) return
                 buffering.current = false
-                // Finished buffering — tell partner to resume from here.
-                channel.sendPlayer({ action: "resume", videoTime: playerRef.current?.getTime() ?? 0 })
+                broadcastPlayerState("resume")
               })
             }
           />
-          <SourceControls onUrl={onUrl} onFile={onFile} hint={hint} />
+          <SourceControls
+            onUrl={handleUrl}
+            onFile={handleFile}
+            onCancelUpload={cancelUpload}
+            uploading={uploading}
+            uploadProgress={uploadProgress}
+            hint={hint}
+          />
         </div>
 
         <div className="h-[420px] lg:h-auto">
@@ -347,8 +710,17 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
             items={chatItems}
             myId={channel.myId}
             onSend={(text) => {
-              const msg = channel.sendChat(text)
-              setChatItems((prev) => [...prev, { kind: "chat", ...msg }])
+              const message = channel.sendChat(text)
+              appendChat(message)
+              void persistRoomMessage(roomId, message)
+                .then(() => setPersistenceError(null))
+                .catch((error) => {
+                  setPersistenceError(
+                    error instanceof Error
+                      ? `Message was sent live but not saved: ${error.message}`
+                      : "Message was sent live but not saved.",
+                  )
+                })
             }}
           />
         </div>
@@ -367,15 +739,24 @@ function StatusPill({
   partnerName?: string
 }) {
   const online = status === "connected" && hasPartner
+  const label =
+    status === "connecting"
+      ? "Connecting…"
+      : status === "reconnecting"
+        ? "Reconnecting…"
+        : status === "error"
+          ? "Connection error"
+          : online
+            ? `${partnerName ?? "Partner"} connected`
+            : "Waiting for partner"
+
   return (
     <div className="flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-sm">
       <span
         className={`h-2 w-2 rounded-full ${online ? "bg-primary" : "bg-muted-foreground"}`}
         aria-hidden
       />
-      <span className="text-card-foreground">
-        {online ? `${partnerName ?? "Partner"} connected` : "Waiting for partner"}
-      </span>
+      <span className="text-card-foreground">{label}</span>
     </div>
   )
 }

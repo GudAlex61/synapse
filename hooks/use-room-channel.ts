@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { RealtimeChannel } from "@supabase/supabase-js"
 import { createClient } from "@/lib/supabase/client"
 import { getClientId } from "@/lib/room"
@@ -12,7 +12,12 @@ import type {
   StateResponse,
 } from "@/lib/sync-types"
 
-export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "full"
+export type ConnectionStatus =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "full"
+  | "error"
 
 interface Handlers {
   onPlayer?: (e: PlayerEvent) => void
@@ -29,50 +34,167 @@ interface Options {
   handlers: Handlers
 }
 
+interface QueuedBroadcast {
+  event: string
+  payload: unknown
+}
+
 const MAX_PEERS = 2
+const MAX_QUEUE = 100
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+}
+
+function isPlayerEvent(value: unknown): value is PlayerEvent {
+  return (
+    isRecord(value) &&
+    ["play", "pause", "seek", "buffer", "resume"].includes(String(value.action)) &&
+    isFiniteNumber(value.videoTime) &&
+    isFiniteNumber(value.at) &&
+    typeof value.senderId === "string"
+  )
+}
+
+function isChatEvent(value: unknown): value is ChatEvent {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.senderId === "string" &&
+    typeof value.senderName === "string" &&
+    typeof value.text === "string" &&
+    value.text.length <= 500 &&
+    isFiniteNumber(value.at)
+  )
+}
+
+function isSourceInfo(value: unknown): value is SourceInfo {
+  if (!isRecord(value)) return false
+  if (!["url", "storage", "uploading"].includes(String(value.kind))) return false
+  if (typeof value.label !== "string" || typeof value.senderId !== "string") return false
+  if (value.duration !== null && !isFiniteNumber(value.duration)) return false
+  if (value.kind === "url" || value.kind === "storage") {
+    if (typeof value.url !== "string" || value.url.length > 4000) return false
+    try {
+      const url = new URL(value.url)
+      if (url.protocol !== "http:" && url.protocol !== "https:") return false
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+function isStateResponse(value: unknown): value is StateResponse {
+  return (
+    isRecord(value) &&
+    (value.source === null || isSourceInfo(value.source)) &&
+    isFiniteNumber(value.videoTime) &&
+    typeof value.playing === "boolean" &&
+    isFiniteNumber(value.at) &&
+    typeof value.senderId === "string" &&
+    ["join", "heartbeat", "source"].includes(String(value.reason)) &&
+    (value.toId === undefined || typeof value.toId === "string")
+  )
+}
 
 export function useRoomChannel({ roomId, userName, handlers }: Options) {
   const myId = useRef<string>(getClientId())
+  const joinedAt = useRef(Date.now())
   const channelRef = useRef<RealtimeChannel | null>(null)
+  const readyRef = useRef(false)
+  const queueRef = useRef<QueuedBroadcast[]>([])
+  const retryTimerRef = useRef<number | null>(null)
   const [status, setStatus] = useState<ConnectionStatus>("connecting")
+  const [connectionError, setConnectionError] = useState<string | null>(null)
   const [peers, setPeers] = useState<Peer[]>([])
 
-  // Keep the latest handlers in a ref so the channel effect doesn't re-run
-  // (and re-subscribe) every render.
+  // Keep the latest handlers in a ref so the channel effect doesn't re-run.
   const handlersRef = useRef(handlers)
   handlersRef.current = handlers
 
   const userNameRef = useRef(userName)
   userNameRef.current = userName
 
+  const sendNow = useCallback(async (event: string, payload: unknown) => {
+    const queue = () => {
+      queueRef.current = [...queueRef.current.slice(-(MAX_QUEUE - 1)), { event, payload }]
+    }
+    const channel = channelRef.current
+    if (!channel || !readyRef.current) {
+      queue()
+      return
+    }
+
+    try {
+      const result = await channel.send({ type: "broadcast", event, payload })
+      if (result === "ok") return
+      queue()
+    } catch {
+      queue()
+    }
+
+    setStatus((current) => (current === "full" ? current : "reconnecting"))
+    if (retryTimerRef.current === null) {
+      retryTimerRef.current = window.setTimeout(() => {
+        retryTimerRef.current = null
+        const next = queueRef.current.shift()
+        if (next) void sendNow(next.event, next.payload)
+      }, 1000)
+    }
+  }, [])
+
   useEffect(() => {
     if (!roomId) return
-    const supabase = createClient()
-    const id = myId.current
 
+    let supabase: ReturnType<typeof createClient>
+    try {
+      supabase = createClient()
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : "Supabase is not configured.")
+      setStatus("error")
+      return
+    }
+
+    const id = myId.current
+    joinedAt.current = Date.now()
+    queueRef.current = []
     const channel = supabase.channel(`room:${roomId}`, {
       config: {
-        broadcast: { self: false },
+        broadcast: { self: false, ack: true },
         presence: { key: id },
       },
     })
     channelRef.current = channel
+    readyRef.current = false
+    setConnectionError(null)
+    setStatus("connecting")
 
     const computePeers = () => {
       const state = channel.presenceState<{ id: string; name: string; onlineAt: number }>()
       const flat: Peer[] = []
+
       for (const key of Object.keys(state)) {
         const metas = state[key]
-        if (metas.length > 0) {
-          const m = metas[0]
-          flat.push({ id: m.id, name: m.name, onlineAt: m.onlineAt })
-        }
+        const meta = metas.at(-1)
+        if (!meta || typeof meta.id !== "string") continue
+        flat.push({
+          id: meta.id,
+          name: typeof meta.name === "string" ? meta.name : "Partner",
+          onlineAt: typeof meta.onlineAt === "number" ? meta.onlineAt : Date.now(),
+        })
       }
-      // Deterministic ordering: earliest joiner first. If more than MAX_PEERS
-      // are present, the later joiners are the "overflow".
-      flat.sort((a, b) => a.onlineAt - b.onlineAt)
+
+      flat.sort((a, b) => a.onlineAt - b.onlineAt || a.id.localeCompare(b.id))
       return flat
     }
+
+    const ignoreOwnPayload = (payload: unknown) =>
+      isRecord(payload) && payload.senderId === id
 
     channel
       .on("presence", { event: "sync" }, () => {
@@ -80,20 +202,19 @@ export function useRoomChannel({ roomId, userName, handlers }: Options) {
         setPeers(flat)
 
         const allowed = flat.slice(0, MAX_PEERS)
-        const amAllowed = allowed.some((p) => p.id === id)
+        const amAllowed = allowed.some((peer) => peer.id === id)
         if (!amAllowed && flat.length > MAX_PEERS) {
+          readyRef.current = false
           setStatus("full")
-          channel.untrack()
-        } else if (status !== "full") {
-          setStatus("connected")
+          void channel.untrack()
+        } else {
+          setStatus((current) => (current === "full" ? current : "connected"))
         }
       })
       .on("presence", { event: "join" }, ({ key }) => {
-        if (key !== id) {
-          const flat = computePeers()
-          const joiner = flat.find((p) => p.id === key)
-          if (joiner) handlersRef.current.onSystem?.(`${joiner.name} joined`)
-        }
+        if (key === id) return
+        const joiner = computePeers().find((peer) => peer.id === key)
+        if (joiner) handlersRef.current.onSystem?.(`${joiner.name} joined`)
       })
       .on("presence", { event: "leave" }, ({ key }) => {
         if (key !== id) {
@@ -101,57 +222,76 @@ export function useRoomChannel({ roomId, userName, handlers }: Options) {
         }
       })
       .on("broadcast", { event: "player" }, ({ payload }) => {
-        handlersRef.current.onPlayer?.(payload as PlayerEvent)
+        if (!ignoreOwnPayload(payload) && isPlayerEvent(payload)) {
+          handlersRef.current.onPlayer?.(payload)
+        }
       })
       .on("broadcast", { event: "chat" }, ({ payload }) => {
-        handlersRef.current.onChat?.(payload as ChatEvent)
+        if (!ignoreOwnPayload(payload) && isChatEvent(payload)) {
+          handlersRef.current.onChat?.(payload)
+        }
       })
       .on("broadcast", { event: "source" }, ({ payload }) => {
-        handlersRef.current.onSource?.(payload as SourceInfo)
+        if (!ignoreOwnPayload(payload) && isSourceInfo(payload)) {
+          handlersRef.current.onSource?.(payload)
+        }
       })
       .on("broadcast", { event: "state-request" }, ({ payload }) => {
-        handlersRef.current.onStateRequest?.((payload as { fromId: string }).fromId)
+        if (!isRecord(payload) || typeof payload.fromId !== "string" || payload.fromId === id) return
+        handlersRef.current.onStateRequest?.(payload.fromId)
       })
       .on("broadcast", { event: "state-response" }, ({ payload }) => {
-        const res = payload as StateResponse
-        // Only the requester cares; but broadcast reaches everyone, so the
-        // consumer decides whether it still needs the state.
-        handlersRef.current.onStateResponse?.(res)
+        if (!ignoreOwnPayload(payload) && isStateResponse(payload)) {
+          handlersRef.current.onStateResponse?.(payload)
+        }
       })
-      .subscribe(async (channelStatus) => {
+      .subscribe(async (channelStatus, error) => {
         if (channelStatus === "SUBSCRIBED") {
-          await channel.track({ id, name: userNameRef.current, onlineAt: Date.now() })
-          setStatus((s) => (s === "full" ? s : "connected"))
-          // Ask any existing member for the current playback state.
-          channel.send({
-            type: "broadcast",
-            event: "state-request",
-            payload: { fromId: id },
+          readyRef.current = true
+          await channel.track({
+            id,
+            name: userNameRef.current,
+            onlineAt: joinedAt.current,
           })
-        } else if (channelStatus === "CHANNEL_ERROR" || channelStatus === "TIMED_OUT") {
-          setStatus("reconnecting")
-        } else if (channelStatus === "CLOSED") {
-          setStatus("reconnecting")
+          setStatus((current) => (current === "full" ? current : "connected"))
+
+          const queued = queueRef.current
+          queueRef.current = []
+          for (const item of queued) await sendNow(item.event, item.payload)
+
+          await sendNow("state-request", { fromId: id })
+        } else if (
+          channelStatus === "CHANNEL_ERROR" ||
+          channelStatus === "TIMED_OUT" ||
+          channelStatus === "CLOSED"
+        ) {
+          readyRef.current = false
+          if (error) setConnectionError(error.message)
+          setStatus((current) => (current === "full" ? current : "reconnecting"))
         }
       })
 
     return () => {
-      channel.untrack()
-      supabase.removeChannel(channel)
+      readyRef.current = false
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
+      void channel.untrack()
+      void supabase.removeChannel(channel)
       channelRef.current = null
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId])
-
-  const send = useCallback((event: string, payload: unknown) => {
-    channelRef.current?.send({ type: "broadcast", event, payload })
-  }, [])
+  }, [roomId, sendNow])
 
   const sendPlayer = useCallback(
-    (e: Omit<PlayerEvent, "senderId" | "at">) => {
-      send("player", { ...e, senderId: myId.current, at: Date.now() } satisfies PlayerEvent)
+    (event: Omit<PlayerEvent, "senderId" | "at">) => {
+      void sendNow("player", {
+        ...event,
+        senderId: myId.current,
+        at: Date.now(),
+      } satisfies PlayerEvent)
     },
-    [send],
+    [sendNow],
   )
 
   const sendChat = useCallback(
@@ -163,38 +303,49 @@ export function useRoomChannel({ roomId, userName, handlers }: Options) {
         text,
         at: Date.now(),
       }
-      send("chat", payload)
+      void sendNow("chat", payload)
       return payload
     },
-    [send],
+    [sendNow],
   )
 
   const sendSource = useCallback(
     (info: Omit<SourceInfo, "senderId">) => {
-      send("source", { ...info, senderId: myId.current } satisfies SourceInfo)
+      const payload = { ...info, senderId: myId.current } satisfies SourceInfo
+      void sendNow("source", payload)
+      return payload
     },
-    [send],
+    [sendNow],
   )
 
   const sendState = useCallback(
     (state: Omit<StateResponse, "senderId" | "at">) => {
-      send("state-response", {
+      void sendNow("state-response", {
         ...state,
         senderId: myId.current,
         at: Date.now(),
       } satisfies StateResponse)
     },
-    [send],
+    [sendNow],
   )
 
-  return {
-    myId: myId.current,
-    status,
-    peers,
-    partner: peers.find((p) => p.id !== myId.current) ?? null,
-    sendPlayer,
-    sendChat,
-    sendSource,
-    sendState,
-  }
+  const partner = useMemo(
+    () => peers.find((peer) => peer.id !== myId.current) ?? null,
+    [peers],
+  )
+
+  return useMemo(
+    () => ({
+      myId: myId.current,
+      status,
+      connectionError,
+      peers,
+      partner,
+      sendPlayer,
+      sendChat,
+      sendSource,
+      sendState,
+    }),
+    [connectionError, partner, peers, sendChat, sendPlayer, sendSource, sendState, status],
+  )
 }

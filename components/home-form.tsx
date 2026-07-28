@@ -3,7 +3,12 @@
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
-import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from "@/lib/room"
+import {
+  generateRoomCode,
+  isValidRoomCode,
+  normalizeDisplayName,
+  normalizeRoomCode,
+} from "@/lib/room"
 
 const NAME_KEY = "watch-together:name"
 
@@ -19,13 +24,13 @@ export function HomeForm() {
   }, [])
 
   const enter = (roomId: string) => {
-    const trimmed = name.trim()
-    if (!trimmed) {
+    const normalizedName = normalizeDisplayName(name)
+    if (!normalizedName) {
       setError("Enter a display name first.")
       return
     }
-    window.localStorage.setItem(NAME_KEY, trimmed)
-    router.push(`/room/${roomId}?name=${encodeURIComponent(trimmed)}`)
+    window.localStorage.setItem(NAME_KEY, normalizedName)
+    router.push(`/room/${roomId}`)
   }
 
   const handleCreate = () => {
@@ -37,7 +42,7 @@ export function HomeForm() {
     setError(null)
     const clean = normalizeRoomCode(code)
     if (!isValidRoomCode(clean)) {
-      setError("Room codes are 6 letters/numbers.")
+      setError("Room codes use 6 characters without 0, O, 1 or I.")
       return
     }
     enter(clean)
@@ -53,8 +58,12 @@ export function HomeForm() {
           id="name"
           value={name}
           onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !code) handleCreate()
+          }}
           placeholder="e.g. Alex"
           maxLength={24}
+          autoComplete="nickname"
           className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-ring"
         />
       </div>
@@ -81,7 +90,11 @@ export function HomeForm() {
             onKeyDown={(e) => {
               if (e.key === "Enter") handleJoin()
             }}
-            placeholder="ABC123"
+            placeholder="ABC234"
+            maxLength={6}
+            autoCapitalize="characters"
+            autoCorrect="off"
+            spellCheck={false}
             className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm uppercase tracking-widest text-foreground outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-ring"
           />
           <Button variant="secondary" onClick={handleJoin}>

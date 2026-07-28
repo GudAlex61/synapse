@@ -26,7 +26,7 @@ interface VideoPlayerProps {
   onSeeked?: () => void
   onWaiting?: () => void
   onPlaying?: () => void
-  onLoadedMetadata?: (duration: number) => void
+  onLoadedMetadata?: (duration: number | null) => void
   onError?: (message: string) => void
 }
 
@@ -43,20 +43,26 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       onError,
     } = props
     const videoRef = useRef<HTMLVideoElement>(null)
-    const [needsGesture, setNeedsGesture] = useState(true)
+    const onErrorRef = useRef(onError)
+    onErrorRef.current = onError
+    const [needsGesture, setNeedsGesture] = useState(false)
 
     useImperativeHandle(ref, () => ({
       play: async () => {
         try {
           await videoRef.current?.play()
+          setNeedsGesture(false)
         } catch {
-          // Autoplay blocked (iOS) — surface the gesture overlay.
+          // Autoplay can be blocked on mobile browsers.
           setNeedsGesture(true)
         }
       },
       pause: () => videoRef.current?.pause(),
-      seek: (t: number) => {
-        if (videoRef.current) videoRef.current.currentTime = t
+      seek: (time: number) => {
+        const video = videoRef.current
+        if (!video || !Number.isFinite(time)) return
+        const duration = Number.isFinite(video.duration) ? video.duration : Number.POSITIVE_INFINITY
+        video.currentTime = Math.max(0, Math.min(time, duration))
       },
       getTime: () => videoRef.current?.currentTime ?? 0,
       getDuration: () => videoRef.current?.duration ?? 0,
@@ -66,34 +72,52 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     // Load the source, using hls.js for m3u8 where the browser lacks native HLS.
     useEffect(() => {
       const video = videoRef.current
-      if (!video || !src) return
+      if (!video) return
 
-      const isHls = /\.m3u8($|\?)/i.test(src)
+      setNeedsGesture(false)
       let hls: Hls | null = null
 
+      if (!src) {
+        video.pause()
+        video.removeAttribute("src")
+        video.load()
+        return
+      }
+
+      const isHls = /\.m3u8($|\?)/i.test(src)
       if (isHls && !video.canPlayType("application/vnd.apple.mpegurl") && Hls.isSupported()) {
         hls = new Hls({ enableWorker: true })
         hls.loadSource(src)
         hls.attachMedia(video)
-        hls.on(Hls.Events.ERROR, (_e, data) => {
-          if (data.fatal) onError?.("Could not load this HLS stream.")
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (!data.fatal) return
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls?.startLoad()
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls?.recoverMediaError()
+          } else {
+            onErrorRef.current?.("Could not load this HLS stream.")
+          }
         })
       } else {
         video.src = src
+        video.load()
       }
 
       return () => {
-        if (hls) hls.destroy()
+        hls?.destroy()
+        video.pause()
+        video.removeAttribute("src")
+        video.load()
       }
-      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [src])
 
     const handleGesture = async () => {
-      setNeedsGesture(false)
       try {
         await videoRef.current?.play()
+        setNeedsGesture(false)
       } catch {
-        /* user can use controls */
+        setNeedsGesture(true)
       }
     }
 
@@ -104,14 +128,22 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
           className="h-full w-full"
           controls
           playsInline
-          preload="auto"
-          crossOrigin="anonymous"
-          onPlay={onPlay}
+          preload="metadata"
+          onPlay={() => {
+            setNeedsGesture(false)
+            onPlay?.()
+          }}
           onPause={onPause}
           onSeeked={onSeeked}
           onWaiting={onWaiting}
-          onPlaying={onPlaying}
-          onLoadedMetadata={(e) => onLoadedMetadata?.(e.currentTarget.duration)}
+          onPlaying={() => {
+            setNeedsGesture(false)
+            onPlaying?.()
+          }}
+          onLoadedMetadata={(e) => {
+            const duration = e.currentTarget.duration
+            onLoadedMetadata?.(Number.isFinite(duration) ? duration : null)
+          }}
           onError={() => {
             if (src) onError?.("Could not load this video source.")
           }}
@@ -127,7 +159,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             <span className="flex h-16 w-16 items-center justify-center rounded-full bg-primary text-primary-foreground">
               <Play className="h-7 w-7 translate-x-0.5" fill="currentColor" />
             </span>
-            <span className="text-sm font-medium">Tap to start watching</span>
+            <span className="text-sm font-medium">Tap to continue watching</span>
           </button>
         )}
 

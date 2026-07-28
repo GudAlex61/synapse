@@ -1,33 +1,40 @@
-# synapse
+# Watch Together
 
-This is a [Next.js](https://nextjs.org) project bootstrapped with [v0](https://v0.app).
+A two-person synchronized video room built with Next.js and Supabase Realtime, Postgres and Storage.
 
-## Built with v0
+## Required Supabase setup
 
-This repository is linked to a [v0](https://v0.app) project. You can continue developing by visiting the link below -- start new chats to make changes, and v0 will push commits directly to this repo. Every merge to `main` will automatically deploy.
-
-[Continue working on v0 →](https://v0.app/chat/projects/prj_aQuXIb73KtAgARWn56g8qRwHoyAb)
-
-## Getting Started
-
-First, run the development server:
+1. Create or open a Supabase project.
+2. Run `supabase/migrations/001_watch_rooms.sql` in the Supabase SQL Editor.
+3. Copy `.env.example` to `.env.local` and fill in the project URL and anon/publishable key.
+4. Install and run:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
 pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The migration creates:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- persistent room playback state;
+- the latest 500 chat messages per room;
+- restricted RPC functions used by the browser;
+- a public `room-videos` Storage bucket with a 5 GB bucket limit;
+- Storage policies for resumable room video uploads and cleanup.
 
-## Learn More
+Your Supabase project or plan can impose a lower per-file limit than the bucket setting. Uploaded files use random object names. Room codes act as the access secret; for a public production service, add authentication and stricter ownership policies.
 
-To learn more, take a look at the following resources:
+## Verification commands
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-- [v0 Documentation](https://v0.app/docs) - learn about v0 and how to use it.
+```bash
+pnpm test
+pnpm lint
+pnpm build
+```
+
+## Persistence behavior
+
+- Chat and playback state are saved in Supabase and mirrored in localStorage as an offline fallback.
+- A refreshed client restores the source, playback position, play/pause state and chat history.
+- Local files play immediately for the uploader, then upload to Supabase Storage using resumable 6 MB TUS chunks. The partner automatically switches to the shared Storage URL when upload finishes.
+- The previous uploaded room video is removed after a replacement upload succeeds.

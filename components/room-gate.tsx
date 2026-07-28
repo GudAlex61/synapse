@@ -4,17 +4,12 @@ import { useEffect, useState } from "react"
 import { Clapperboard } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { WatchRoom } from "@/components/watch-room"
+import { normalizeDisplayName } from "@/lib/room"
 
 const NAME_KEY = "watch-together:name"
 
-export function RoomGate({
-  roomId,
-  initialName,
-}: {
-  roomId: string
-  initialName: string
-}) {
-  const [name, setName] = useState<string | null>(initialName || null)
+export function RoomGate({ roomId, initialName = "" }: { roomId: string; initialName?: string }) {
+  const [name, setName] = useState<string | null>(() => normalizeDisplayName(initialName) || null)
   const [draft, setDraft] = useState("")
 
   useEffect(() => {
@@ -22,9 +17,14 @@ export function RoomGate({
       window.localStorage.setItem(NAME_KEY, name)
       return
     }
-    const saved = window.localStorage.getItem(NAME_KEY)
+    const saved = normalizeDisplayName(window.localStorage.getItem(NAME_KEY) ?? "")
     if (saved) setName(saved)
   }, [name])
+
+  const enter = () => {
+    const normalized = normalizeDisplayName(draft)
+    if (normalized) setName(normalized)
+  }
 
   if (!name) {
     return (
@@ -43,13 +43,15 @@ export function RoomGate({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && draft.trim()) setName(draft.trim())
+              if (e.key === "Enter") enter()
             }}
             placeholder="Your name"
             maxLength={24}
+            autoFocus
+            autoComplete="nickname"
             className="mb-3 w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-ring"
           />
-          <Button className="w-full" onClick={() => draft.trim() && setName(draft.trim())}>
+          <Button className="w-full" onClick={enter} disabled={!normalizeDisplayName(draft)}>
             Enter room
           </Button>
         </div>
