@@ -180,7 +180,7 @@ export function useRoomChannel({ roomId, userName, handlers }: Options) {
 
     try {
       const result = await channel.httpSend(event, payload)
-      return result === "ok"
+      return result.success
     } catch {
       return false
     }
