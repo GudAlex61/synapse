@@ -97,6 +97,8 @@ export interface RtcSignal {
   at: number
 }
 
+export type P2PQualityPreset = "auto" | "high" | "balanced" | "saver"
+
 export type P2PConnectionStatus =
   | "idle"
   | "waiting-owner"
@@ -109,8 +111,17 @@ export type P2PConnectionStatus =
 
 export interface P2PStats {
   bitrateKbps: number | null
+  availableOutgoingBitrateKbps: number | null
   roundTripMs: number | null
   packetsLost: number | null
+  packetLossPercent: number | null
   framesPerSecond: number | null
+  frameWidth: number | null
+  frameHeight: number | null
+  framesDropped: number | null
+  freezeCount: number | null
+  jitterMs: number | null
   candidateType: string | null
+  codec: string | null
+  qualityLimitationReason: string | null
 }

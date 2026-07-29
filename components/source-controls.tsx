@@ -3,6 +3,7 @@
 import { useRef, useState } from "react"
 import { LinkIcon, Radio, RotateCcw } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import type { P2PQualityPreset } from "@/lib/sync-types"
 
 interface SourceControlsProps {
   onUrl: (url: string) => void
@@ -11,6 +12,9 @@ interface SourceControlsProps {
   canRestore?: boolean
   hint?: string | null
   disabled?: boolean
+  qualityPreset?: P2PQualityPreset
+  onQualityPresetChange?: (preset: P2PQualityPreset) => void
+  showQuality?: boolean
 }
 
 interface WindowWithPicker extends Window {
@@ -28,6 +32,9 @@ export function SourceControls({
   canRestore = false,
   hint,
   disabled = false,
+  qualityPreset = "auto",
+  onQualityPresetChange,
+  showQuality = false,
 }: SourceControlsProps) {
   const [url, setUrl] = useState("")
   const fileRef = useRef<HTMLInputElement>(null)
@@ -110,8 +117,24 @@ export function SourceControls({
         )}
       </div>
 
+      {showQuality && (
+        <label className="mt-3 flex flex-col gap-1.5 text-sm text-card-foreground sm:max-w-xs">
+          <span className="font-medium">Качество P2P-трансляции</span>
+          <select
+            value={qualityPreset}
+            onChange={(event) => onQualityPresetChange?.(event.target.value as P2PQualityPreset)}
+            className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+          >
+            <option value="auto">Авто — адаптивное до 1080p</option>
+            <option value="high">Высокое — приоритет детализации</option>
+            <option value="balanced">Стабильное — 720p / 30 FPS</option>
+            <option value="saver">Экономное — 540p / 24 FPS</option>
+          </select>
+        </label>
+      )}
+
       <p className="mt-3 text-xs text-muted-foreground">
-        Файл остаётся на устройстве владельца. Второму участнику передаётся живой зашифрованный WebRTC-поток; размер файла не расходует облачное хранилище.
+        Файл не загружается целиком: браузер передаёт только живой WebRTC-поток. Поэтому фильм размером 2 ГБ требует примерно ту же скорость сети, что и серия 500 МБ; важны разрешение, FPS и выбранный профиль качества.
       </p>
       {hint && <p className="mt-3 text-sm text-muted-foreground">{hint}</p>}
     </div>

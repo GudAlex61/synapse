@@ -1,4 +1,10 @@
-import type { P2PStats } from "./sync-types.ts"
+import type { P2PQualityPreset, P2PStats } from "./sync-types.ts"
+import {
+  orderMovieCodecs,
+  resolveMovieEncodingPlan,
+  type AdaptiveQualityLevel,
+  type MovieEncodingPlan,
+} from "./webrtc-quality.ts"
 
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.cloudflare.com:3478" },
@@ -15,7 +21,33 @@ export function parseIceServers(value?: string): RTCIceServer[] {
   return urls.length > 0 ? urls.map((urls) => ({ urls })) : DEFAULT_ICE_SERVERS
 }
 
-export async function tuneMovieSenders(connection: RTCPeerConnection): Promise<void> {
+export function configureMovieCodecs(connection: RTCPeerConnection): string[] {
+  const capabilities = typeof RTCRtpReceiver !== "undefined" ? RTCRtpReceiver.getCapabilities?.("video") : null
+  if (!capabilities?.codecs?.length) return []
+  const ordered = orderMovieCodecs(capabilities.codecs)
+  const applied: string[] = []
+  for (const transceiver of connection.getTransceivers()) {
+    if (transceiver.sender.track?.kind !== "video" || typeof transceiver.setCodecPreferences !== "function") continue
+    try {
+      transceiver.setCodecPreferences(ordered)
+      applied.push(...ordered.map((codec) => codec.mimeType))
+    } catch {
+      // The browser default remains a safe fallback on older mobile versions.
+    }
+  }
+  return [...new Set(applied)]
+}
+
+type MutableEncoding = RTCRtpEncodingParameters & {
+  networkPriority?: "very-low" | "low" | "medium" | "high"
+}
+
+export async function applyMovieSenderPlan(
+  connection: RTCPeerConnection,
+  preset: P2PQualityPreset,
+  level: AdaptiveQualityLevel,
+): Promise<MovieEncodingPlan | null> {
+  let selectedPlan: MovieEncodingPlan | null = null
   for (const sender of connection.getSenders()) {
     const track = sender.track
     if (!track) continue
@@ -24,17 +56,69 @@ export async function tuneMovieSenders(connection: RTCPeerConnection): Promise<v
     } catch {
       // Optional browser hint.
     }
+
+    const parameters = sender.getParameters()
+    parameters.encodings ??= [{}]
+    const encoding = parameters.encodings[0] as MutableEncoding
+    encoding.priority = "high"
+    encoding.networkPriority = "high"
+
+    if (track.kind === "audio") {
+      encoding.maxBitrate = 192_000
+      await sender.setParameters(parameters).catch(() => undefined)
+      continue
+    }
     if (track.kind !== "video") continue
+
+    const settings = track.getSettings?.() ?? {}
+    const sourceHeight = typeof settings.height === "number" ? settings.height : undefined
+    const plan = resolveMovieEncodingPlan(preset, level, sourceHeight)
+    selectedPlan = plan
+    encoding.maxBitrate = plan.maxBitrate
+    encoding.maxFramerate = plan.maxFramerate
+    if (sourceHeight && sourceHeight > plan.targetHeight) {
+      encoding.scaleResolutionDownBy = Math.max(1, sourceHeight / plan.targetHeight)
+    } else {
+      encoding.scaleResolutionDownBy = 1
+    }
+    parameters.degradationPreference = plan.degradationPreference
+
     try {
-      const parameters = sender.getParameters()
-      if (!parameters.encodings || parameters.encodings.length === 0) parameters.encodings = [{}]
-      parameters.encodings[0].maxBitrate = 12_000_000
-      parameters.degradationPreference = "maintain-framerate"
       await sender.setParameters(parameters)
     } catch {
-      // Browser-controlled defaults remain a safe fallback.
+      // Safari and older Chromium builds may reject one optional field. Retry
+      // with the broadly-supported bitrate/framerate subset.
+      try {
+        const fallback = sender.getParameters()
+        fallback.encodings ??= [{}]
+        fallback.encodings[0].maxBitrate = plan.maxBitrate
+        fallback.encodings[0].maxFramerate = plan.maxFramerate
+        fallback.degradationPreference = plan.degradationPreference
+        await sender.setParameters(fallback)
+      } catch {
+        // Browser congestion control remains available even without overrides.
+      }
+    }
+
+    const applied = sender.getParameters().encodings?.[0]
+    if (
+      sourceHeight &&
+      sourceHeight > plan.targetHeight &&
+      (!applied?.scaleResolutionDownBy || applied.scaleResolutionDownBy <= 1) &&
+      typeof track.applyConstraints === "function"
+    ) {
+      await track.applyConstraints({
+        height: { max: plan.targetHeight },
+        frameRate: { max: plan.maxFramerate },
+      }).catch(() => undefined)
     }
   }
+  return selectedPlan
+}
+
+// Kept for compatibility with older callers and tests.
+export async function tuneMovieSenders(connection: RTCPeerConnection): Promise<void> {
+  await applyMovieSenderPlan(connection, "auto", 0)
 }
 
 export function isSessionDescriptionPayload(
@@ -103,6 +187,19 @@ export function getIceCandidateType(candidate: RTCIceCandidateInit | null): stri
   return match?.[1]?.toLowerCase() ?? null
 }
 
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+function readCodec(entries: Map<string, Record<string, unknown>>, codecId: unknown): string | null {
+  if (typeof codecId !== "string") return null
+  const codec = entries.get(codecId)
+  if (!codec) return null
+  const mimeType = typeof codec.mimeType === "string" ? codec.mimeType : null
+  const fmtp = typeof codec.sdpFmtpLine === "string" && codec.sdpFmtpLine ? codec.sdpFmtpLine : null
+  return mimeType ? `${mimeType.replace(/^video\//i, "")}${fmtp ? ` (${fmtp})` : ""}` : null
+}
+
 export async function readConnectionStats(
   connection: RTCPeerConnection,
   previousBytes: number | null,
@@ -111,9 +208,18 @@ export async function readConnectionStats(
   const report = await connection.getStats()
   let bytes: number | null = null
   let packetsLost: number | null = null
+  let packetsTotal: number | null = null
   let framesPerSecond: number | null = null
+  let frameWidth: number | null = null
+  let frameHeight: number | null = null
+  let framesDropped: number | null = null
+  let freezeCount: number | null = null
+  let jitterMs: number | null = null
   let roundTripMs: number | null = null
+  let availableOutgoingBitrateKbps: number | null = null
   let candidateType: string | null = null
+  let codec: string | null = null
+  let qualityLimitationReason: string | null = null
   const now = Date.now()
 
   const entries = new Map<string, Record<string, unknown>>()
@@ -123,17 +229,44 @@ export async function readConnectionStats(
   })
 
   entries.forEach((item) => {
-    if (item.type === "outbound-rtp" && item.kind === "video" && !item.isRemote) {
-      if (typeof item.bytesSent === "number") bytes = item.bytesSent
-      if (typeof item.framesPerSecond === "number") framesPerSecond = item.framesPerSecond
+    const kind = item.kind ?? item.mediaType
+    if (item.type === "outbound-rtp" && kind === "video" && !item.isRemote) {
+      bytes = finiteNumber(item.bytesSent) ?? bytes
+      framesPerSecond = finiteNumber(item.framesPerSecond) ?? framesPerSecond
+      frameWidth = finiteNumber(item.frameWidth) ?? frameWidth
+      frameHeight = finiteNumber(item.frameHeight) ?? frameHeight
+      framesDropped = finiteNumber(item.framesDropped) ?? framesDropped
+      qualityLimitationReason = typeof item.qualityLimitationReason === "string" ? item.qualityLimitationReason : qualityLimitationReason
+      codec = readCodec(entries, item.codecId) ?? codec
     }
-    if (item.type === "inbound-rtp" && item.kind === "video" && !item.isRemote) {
-      if (typeof item.bytesReceived === "number") bytes = item.bytesReceived
-      if (typeof item.packetsLost === "number") packetsLost = item.packetsLost
-      if (typeof item.framesPerSecond === "number") framesPerSecond = item.framesPerSecond
+    if (item.type === "inbound-rtp" && kind === "video" && !item.isRemote) {
+      bytes = finiteNumber(item.bytesReceived) ?? bytes
+      packetsLost = finiteNumber(item.packetsLost) ?? packetsLost
+      const packetsReceived = finiteNumber(item.packetsReceived)
+      if (packetsReceived !== null) packetsTotal = packetsReceived + Math.max(0, packetsLost ?? 0)
+      framesPerSecond = finiteNumber(item.framesPerSecond) ?? framesPerSecond
+      frameWidth = finiteNumber(item.frameWidth) ?? frameWidth
+      frameHeight = finiteNumber(item.frameHeight) ?? frameHeight
+      framesDropped = finiteNumber(item.framesDropped) ?? framesDropped
+      freezeCount = finiteNumber(item.freezeCount) ?? freezeCount
+      const jitter = finiteNumber(item.jitter)
+      if (jitter !== null) jitterMs = jitter * 1000
+      codec = readCodec(entries, item.codecId) ?? codec
+    }
+    if (item.type === "remote-inbound-rtp" && kind === "video") {
+      packetsLost = finiteNumber(item.packetsLost) ?? packetsLost
+      const packetsReceived = finiteNumber(item.packetsReceived)
+      if (packetsReceived !== null) packetsTotal = packetsReceived + Math.max(0, packetsLost ?? 0)
+      const remoteRtt = finiteNumber(item.roundTripTime)
+      if (remoteRtt !== null) roundTripMs = remoteRtt * 1000
+      const jitter = finiteNumber(item.jitter)
+      if (jitter !== null) jitterMs = jitter * 1000
     }
     if (item.type === "candidate-pair" && item.state === "succeeded" && item.nominated) {
-      if (typeof item.currentRoundTripTime === "number") roundTripMs = item.currentRoundTripTime * 1000
+      const pairRtt = finiteNumber(item.currentRoundTripTime)
+      if (pairRtt !== null) roundTripMs = pairRtt * 1000
+      const available = finiteNumber(item.availableOutgoingBitrate)
+      if (available !== null) availableOutgoingBitrateKbps = available / 1000
       const local = typeof item.localCandidateId === "string" ? entries.get(item.localCandidateId) : undefined
       const remote = typeof item.remoteCandidateId === "string" ? entries.get(item.remoteCandidateId) : undefined
       const localType = typeof local?.candidateType === "string" ? local.candidateType : null
@@ -143,12 +276,30 @@ export async function readConnectionStats(
   })
 
   let bitrateKbps: number | null = null
-  if (bytes !== null && previousBytes !== null && previousAt !== null && now > previousAt) {
+  if (bytes !== null && previousBytes !== null && previousAt !== null && now > previousAt && bytes >= previousBytes) {
     bitrateKbps = Math.max(0, ((bytes - previousBytes) * 8) / (now - previousAt))
   }
+  const packetLossPercent = packetsLost !== null && packetsTotal && packetsTotal > 0
+    ? Math.max(0, Math.min(100, (packetsLost / packetsTotal) * 100))
+    : null
 
   return {
-    stats: { bitrateKbps, roundTripMs, packetsLost, framesPerSecond, candidateType },
+    stats: {
+      bitrateKbps,
+      availableOutgoingBitrateKbps,
+      roundTripMs,
+      packetsLost,
+      packetLossPercent,
+      framesPerSecond,
+      frameWidth,
+      frameHeight,
+      framesDropped,
+      freezeCount,
+      jitterMs,
+      candidateType,
+      codec,
+      qualityLimitationReason,
+    },
     bytes,
     at: now,
   }

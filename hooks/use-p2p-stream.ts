@@ -3,20 +3,23 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { pullRtcSignals, pushRtcSignal } from "@/lib/webrtc-signaling"
 import {
+  applyMovieSenderPlan,
+  configureMovieCodecs,
   getIceCandidateType,
   isSessionDescriptionPayload,
   parseIceCandidatePayload,
   parseIceServers,
   readConnectionStats,
-  tuneMovieSenders,
 } from "@/lib/webrtc-core"
-import type { P2PConnectionStatus, P2PStats, RtcSignalKind, SourceInfo } from "@/lib/sync-types"
+import { classifyAutoQuality, resolveMovieEncodingPlan, type AdaptiveQualityLevel, type MovieEncodingPlan } from "@/lib/webrtc-quality"
+import type { P2PConnectionStatus, P2PQualityPreset, P2PStats, RtcSignalKind, SourceInfo } from "@/lib/sync-types"
 
 interface Options {
   roomId: string
   myId: string
   source: SourceInfo | null
   getLocalStream: () => Promise<MediaStream | null>
+  qualityPreset: P2PQualityPreset
 }
 
 const SIGNAL_POLL_MS = 500
@@ -25,21 +28,32 @@ const DISCONNECTED_GRACE_MS = 6_000
 const MAX_ICE_RESTARTS = 2
 const EMPTY_STATS: P2PStats = {
   bitrateKbps: null,
+  availableOutgoingBitrateKbps: null,
   roundTripMs: null,
   packetsLost: null,
+  packetLossPercent: null,
   framesPerSecond: null,
+  frameWidth: null,
+  frameHeight: null,
+  framesDropped: null,
+  freezeCount: null,
+  jitterMs: null,
   candidateType: null,
+  codec: null,
+  qualityLimitationReason: null,
 }
 
 function candidateSummary(types: Set<string>): string {
   return types.size > 0 ? [...types].sort().join(", ") : "нет"
 }
 
-export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) {
+export function useP2PStream({ roomId, myId, source, getLocalStream, qualityPreset }: Options) {
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
   const [status, setStatus] = useState<P2PConnectionStatus>("idle")
   const [error, setError] = useState<string | null>(null)
   const [stats, setStats] = useState<P2PStats>(EMPTY_STATS)
+  const [adaptiveLevel, setAdaptiveLevel] = useState<AdaptiveQualityLevel>(0)
+  const [qualityPlan, setQualityPlan] = useState<MovieEncodingPlan | null>(null)
 
   const connectionRef = useRef<RTCPeerConnection | null>(null)
   const activePeerRef = useRef<string | null>(null)
@@ -58,7 +72,16 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
   const previousStatsBytesRef = useRef<number | null>(null)
   const previousStatsAtRef = useRef<number | null>(null)
   const restartHostIceRef = useRef<() => void>(() => undefined)
+  const applyQualityRef = useRef<() => void>(() => undefined)
+  const qualityPresetRef = useRef(qualityPreset)
+  const adaptiveLevelRef = useRef<AdaptiveQualityLevel>(adaptiveLevel)
+  const qualityPlanRef = useRef<MovieEncodingPlan | null>(null)
+  const badQualitySamplesRef = useRef(0)
+  const goodQualitySamplesRef = useRef(0)
+  const lastQualityChangeRef = useRef(0)
   getLocalStreamRef.current = getLocalStream
+  qualityPresetRef.current = qualityPreset
+  adaptiveLevelRef.current = adaptiveLevel
 
   const p2pSource = source?.kind === "p2p" ? source : null
   const sessionId = p2pSource?.streamSessionId ?? ""
@@ -145,6 +168,7 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
           iceRestartAttemptsRef.current = 0
           setError(null)
           setStatus("connected")
+          applyQualityRef.current()
           return
         }
         if (state === "connecting" || state === "new") {
@@ -194,6 +218,15 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
     attachConnectionHandlers(connection)
     return connection
   }, [attachConnectionHandlers])
+
+  const applyCurrentQuality = useCallback(async (connection = connectionRef.current) => {
+    if (!connection || !isOwner) return null
+    const plan = await applyMovieSenderPlan(connection, qualityPresetRef.current, adaptiveLevelRef.current)
+    qualityPlanRef.current = plan
+    setQualityPlan(plan)
+    return plan
+  }, [isOwner])
+  applyQualityRef.current = () => void applyCurrentQuality()
 
   const sendIceCandidate = useCallback(
     async (recipientId: string, negotiationId: string, candidate: RTCIceCandidateInit | null) => {
@@ -271,9 +304,11 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
         const negotiationId = crypto.randomUUID()
         configureCandidateSignaling(connection, viewerId, negotiationId)
         for (const track of stream.getTracks()) connection.addTrack(track, stream)
-        await tuneMovieSenders(connection)
+        configureMovieCodecs(connection)
+        await applyCurrentQuality(connection)
         const offer = await connection.createOffer()
         await connection.setLocalDescription(offer)
+        await applyCurrentQuality(connection)
         const description = connection.localDescription
         if (!description?.sdp) throw new Error("Browser did not create a WebRTC offer.")
         await sendSignal(viewerId, "offer", {
@@ -291,6 +326,7 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
       }
     },
     [
+      applyCurrentQuality,
       closeConnection,
       configureCandidateSignaling,
       createConnection,
@@ -319,6 +355,7 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
       connection.restartIce()
       const offer = await connection.createOffer({ iceRestart: true })
       await connection.setLocalDescription(offer)
+      await applyCurrentQuality(connection)
       const description = connection.localDescription
       if (!description?.sdp) throw new Error("Browser did not create an ICE-restart offer.")
       await sendSignal(viewerId, "offer", {
@@ -335,6 +372,7 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
       negotiatingRef.current = false
     }
   }, [
+    applyCurrentQuality,
     buildConnectionError,
     configureCandidateSignaling,
     flushLocalCandidates,
@@ -411,12 +449,13 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
       try {
         await connection.setRemoteDescription({ type: payload.type, sdp: payload.sdp })
         await drainRemoteCandidates(connection)
+        await applyCurrentQuality(connection)
       } catch (reason) {
         setError(reason instanceof Error ? reason.message : "Не удалось завершить WebRTC-соединение.")
         resetAfterFailure()
       }
     },
-    [drainRemoteCandidates, isOwner, resetAfterFailure],
+    [applyCurrentQuality, drainRemoteCandidates, isOwner, resetAfterFailure],
   )
 
   const acceptIceCandidate = useCallback(
@@ -448,6 +487,13 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
     lastSignalIdRef.current = 0
     setError(null)
     iceRestartAttemptsRef.current = 0
+    badQualitySamplesRef.current = 0
+    goodQualitySamplesRef.current = 0
+    lastQualityChangeRef.current = 0
+    setAdaptiveLevel(0)
+    adaptiveLevelRef.current = 0
+    setQualityPlan(null)
+    qualityPlanRef.current = null
     resetDiagnostics()
     if (!p2pSource || !sessionId || !ownerId) {
       closeConnection("idle")
@@ -536,13 +582,51 @@ export function useP2PStream({ roomId, myId, source, getLocalStream }: Options) 
           previousStatsBytesRef.current = result.bytes
           previousStatsAtRef.current = result.at
           setStats(result.stats)
+
+          if (!isOwner || qualityPresetRef.current !== "auto") return
+          const plan = qualityPlanRef.current ?? resolveMovieEncodingPlan("auto", adaptiveLevelRef.current)
+          const decision = classifyAutoQuality(result.stats, plan)
+          if (decision === "downgrade") {
+            badQualitySamplesRef.current += 1
+            goodQualitySamplesRef.current = 0
+          } else if (decision === "upgrade") {
+            goodQualitySamplesRef.current += 1
+            badQualitySamplesRef.current = 0
+          } else {
+            badQualitySamplesRef.current = 0
+            goodQualitySamplesRef.current = 0
+          }
+
+          const now = Date.now()
+          if (badQualitySamplesRef.current >= 2 && adaptiveLevelRef.current < 2 && now - lastQualityChangeRef.current > 6_000) {
+            const next = (adaptiveLevelRef.current + 1) as AdaptiveQualityLevel
+            adaptiveLevelRef.current = next
+            setAdaptiveLevel(next)
+            badQualitySamplesRef.current = 0
+            lastQualityChangeRef.current = now
+          } else if (goodQualitySamplesRef.current >= 8 && adaptiveLevelRef.current > 0 && now - lastQualityChangeRef.current > 20_000) {
+            const next = (adaptiveLevelRef.current - 1) as AdaptiveQualityLevel
+            adaptiveLevelRef.current = next
+            setAdaptiveLevel(next)
+            goodQualitySamplesRef.current = 0
+            lastQualityChangeRef.current = now
+          }
         })
         .catch(() => undefined)
     }, 2_000)
     return () => window.clearInterval(interval)
-  }, [])
+  }, [isOwner])
+
+  useEffect(() => {
+    if (qualityPreset !== "auto") {
+      adaptiveLevelRef.current = 0
+      setAdaptiveLevel(0)
+    }
+    const connection = connectionRef.current
+    if (connection?.connectionState === "connected" && isOwner) void applyCurrentQuality(connection)
+  }, [adaptiveLevel, applyCurrentQuality, isOwner, qualityPreset])
 
   useEffect(() => () => closeConnection("idle"), [closeConnection])
 
-  return { remoteStream, status, error, stats, isOwner }
+  return { remoteStream, status, error, stats, isOwner, qualityPlan, adaptiveLevel }
 }
