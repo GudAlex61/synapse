@@ -53,6 +53,7 @@ import type {
   LogicalRevision,
   PersistedRoomState,
   PlayerAction,
+  P2PQualityPreset,
   SourceInfo,
 } from "@/lib/sync-types"
 
@@ -93,6 +94,7 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
   const [copied, setCopied] = useState(false)
   const [leaving, setLeaving] = useState(false)
   const [canRestoreFile, setCanRestoreFile] = useState(false)
+  const [qualityPreset, setQualityPreset] = useState<P2PQualityPreset>("auto")
   const [expandedView, setExpandedView] = useState(false)
   const [fullscreenChatVisible, setFullscreenChatVisible] = useState(true)
 
@@ -372,6 +374,7 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
     myId: channel.myId,
     source: currentSource,
     getLocalStream: async () => playerRef.current?.getCaptureStream() ?? null,
+    qualityPreset,
   })
 
   const isP2PViewer = currentSource?.kind === "p2p" && currentSource.ownerId !== channel.myId
@@ -625,7 +628,16 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
   }
 
   const p2pDetails = currentSource?.kind === "p2p"
-    ? `${formatBytes(currentSource.fileSize)}${p2p.stats.bitrateKbps ? ` · ${Math.round(p2p.stats.bitrateKbps)} Кбит/с` : ""}${p2p.stats.roundTripMs ? ` · ${Math.round(p2p.stats.roundTripMs)} мс` : ""}`
+    ? [
+        formatBytes(currentSource.fileSize),
+        p2p.qualityPlan?.label ?? null,
+        p2p.stats.frameWidth && p2p.stats.frameHeight ? `${p2p.stats.frameWidth}×${p2p.stats.frameHeight}` : null,
+        p2p.stats.framesPerSecond ? `${Math.round(p2p.stats.framesPerSecond)} FPS` : null,
+        p2p.stats.bitrateKbps ? `${Math.round(p2p.stats.bitrateKbps)} Кбит/с` : null,
+        p2p.stats.availableOutgoingBitrateKbps ? `канал ${Math.round(p2p.stats.availableOutgoingBitrateKbps)} Кбит/с` : null,
+        p2p.stats.roundTripMs ? `${Math.round(p2p.stats.roundTripMs)} мс` : null,
+        p2p.stats.codec?.split(" (")[0] ?? null,
+      ].filter(Boolean).join(" · ")
     : ""
 
   return (
@@ -748,6 +760,9 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
             onRestore={() => void restoreFileFromHandle(true)}
             canRestore={canRestoreFile}
             hint={hint}
+            showQuality={currentSource?.kind === "p2p" && currentSource.ownerId === channel.myId}
+            qualityPreset={qualityPreset}
+            onQualityPresetChange={setQualityPreset}
           />
         </div>
       </div>
