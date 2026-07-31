@@ -2,7 +2,18 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
-import { AlertTriangle, ArrowLeft, Check, Copy, Radio, Users } from "lucide-react"
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Check,
+  Copy,
+  Maximize2,
+  MessageSquare,
+  MessageSquareOff,
+  Minimize2,
+  Radio,
+  Users,
+} from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { VideoPlayer, type VideoPlayerHandle } from "@/components/video-player"
 import { Chat } from "@/components/chat"
@@ -42,7 +53,6 @@ import type {
   LogicalRevision,
   PersistedRoomState,
   PlayerAction,
-  P2PQualityPreset,
   SourceInfo,
 } from "@/lib/sync-types"
 
@@ -72,6 +82,7 @@ function formatBytes(value?: number): string {
 export function WatchRoom({ roomId, userName }: { roomId: string; userName: string }) {
   const router = useRouter()
   const playerRef = useRef<VideoPlayerHandle>(null)
+  const viewerShellRef = useRef<HTMLDivElement>(null)
 
   const [chatItems, setChatItems] = useState<ChatItem[]>([])
   const [src, setSrc] = useState<string | null>(null)
@@ -82,7 +93,8 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
   const [copied, setCopied] = useState(false)
   const [leaving, setLeaving] = useState(false)
   const [canRestoreFile, setCanRestoreFile] = useState(false)
-  const [qualityPreset, setQualityPreset] = useState<P2PQualityPreset>("auto")
+  const [expandedView, setExpandedView] = useState(false)
+  const [fullscreenChatVisible, setFullscreenChatVisible] = useState(true)
 
   const sourceRef = useRef<SourceInfo | null>(null)
   const srcRef = useRef<string | null>(null)
@@ -97,6 +109,43 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
   const localCounterRef = useRef(0)
   const lastAppliedRevisionRef = useRef<LogicalRevision>(ZERO_REVISION)
   srcRef.current = src
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("synapse:fullscreen-chat")
+      if (saved === "hidden") setFullscreenChatVisible(false)
+    } catch {
+      // The preference is optional.
+    }
+  }, [])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "synapse:fullscreen-chat",
+        fullscreenChatVisible ? "visible" : "hidden",
+      )
+    } catch {
+      // The preference is optional.
+    }
+  }, [fullscreenChatVisible])
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (!document.fullscreenElement) setExpandedView(false)
+    }
+    document.addEventListener("fullscreenchange", handleFullscreenChange)
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange)
+  }, [])
+
+  useEffect(() => {
+    if (!expandedView) return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = "hidden"
+    return () => {
+      document.body.style.overflow = previousOverflow
+    }
+  }, [expandedView])
 
   const replaceSourceUrl = useCallback((nextSrc: string | null, objectUrl: string | null = null) => {
     if (objectUrlRef.current && objectUrlRef.current !== objectUrl) URL.revokeObjectURL(objectUrlRef.current)
@@ -323,7 +372,6 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
     myId: channel.myId,
     source: currentSource,
     getLocalStream: async () => playerRef.current?.getCaptureStream() ?? null,
-    qualityPreset,
   })
 
   const isP2PViewer = currentSource?.kind === "p2p" && currentSource.ownerId !== channel.myId
@@ -498,6 +546,51 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
     queuePersistState(state)
   }, [channel, currentState, issueRevision, queuePersistState])
 
+  const enterExpandedView = useCallback(() => {
+    const shell = viewerShellRef.current
+    if (!shell) return
+    setExpandedView(true)
+    if (shell.requestFullscreen && document.fullscreenElement !== shell) {
+      void shell.requestFullscreen().catch(() => {
+        // iOS and some embedded browsers do not support element fullscreen.
+        // The fixed-position fallback remains active.
+      })
+    }
+  }, [])
+
+  const exitExpandedView = useCallback(() => {
+    setExpandedView(false)
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => undefined)
+    }
+  }, [])
+
+  const toggleExpandedView = useCallback(() => {
+    if (expandedView) exitExpandedView()
+    else enterExpandedView()
+  }, [enterExpandedView, exitExpandedView, expandedView])
+
+  useEffect(() => {
+    if (!expandedView) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") exitExpandedView()
+    }
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [exitExpandedView, expandedView])
+
+  const sendChatMessage = useCallback((text: string) => {
+    const message = channel.sendChat(text)
+    appendChat(message)
+    void persistRoomMessage(roomId, message).catch((error) => {
+      setPersistenceError(
+        error instanceof Error
+          ? `Сообщение отправлено, но не сохранено: ${error.message}`
+          : "Сообщение не сохранено.",
+      )
+    })
+  }, [appendChat, channel, roomId])
+
   const copyCode = async () => {
     try {
       await navigator.clipboard.writeText(roomId)
@@ -532,16 +625,7 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
   }
 
   const p2pDetails = currentSource?.kind === "p2p"
-    ? [
-        formatBytes(currentSource.fileSize),
-        p2p.qualityPlan?.label ?? null,
-        p2p.stats.frameWidth && p2p.stats.frameHeight ? `${p2p.stats.frameWidth}×${p2p.stats.frameHeight}` : null,
-        p2p.stats.framesPerSecond ? `${Math.round(p2p.stats.framesPerSecond)} FPS` : null,
-        p2p.stats.bitrateKbps ? `${Math.round(p2p.stats.bitrateKbps)} Кбит/с` : null,
-        p2p.stats.availableOutgoingBitrateKbps ? `канал ${Math.round(p2p.stats.availableOutgoingBitrateKbps)} Кбит/с` : null,
-        p2p.stats.roundTripMs ? `${Math.round(p2p.stats.roundTripMs)} мс` : null,
-        p2p.stats.codec?.split(" (")[0] ?? null,
-      ].filter(Boolean).join(" · ")
+    ? `${formatBytes(currentSource.fileSize)}${p2p.stats.bitrateKbps ? ` · ${Math.round(p2p.stats.bitrateKbps)} Кбит/с` : ""}${p2p.stats.roundTripMs ? ` · ${Math.round(p2p.stats.roundTripMs)} мс` : ""}`
     : ""
 
   return (
@@ -573,58 +657,97 @@ export function WatchRoom({ roomId, userName }: { roomId: string; userName: stri
         </Banner>
       )}
 
-      <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_340px]">
-        <div className="flex flex-col gap-4">
-          <VideoPlayer
-            ref={playerRef}
-            src={isP2PViewer ? null : src}
-            stream={isP2PViewer ? p2p.remoteStream : null}
-            readOnly={isP2PViewer}
-            emptyText={
-              isP2PViewer
-                ? "Подключаемся к прямой трансляции владельца…"
-                : currentSource?.kind === "p2p"
-                  ? "Восстановите или выберите локальный файл для продолжения трансляции."
-                  : "Выберите видео или вставьте прямую ссылку."
-            }
-            onLoadedMetadata={(duration) => {
-              const source = sourceRef.current
-              if (!source) return
-              const updated = { ...source, duration }
-              sourceRef.current = updated
-              setCurrentSource(updated)
-              queuePersistState(currentState({ source: updated }))
-              const pending = pendingPlaybackRef.current
-              if (pending && source.kind === "url") applyPlayback(pending, true)
-            }}
-            onError={setVideoError}
-            onPlay={() => broadcastPlayerState("play", true)}
-            onPause={() => broadcastPlayerState("pause", false)}
-            onSeeked={() => broadcastPlayerState("seek", Boolean(playerRef.current && !playerRef.current.isPaused()))}
-          />
+      <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
+        <div
+          ref={viewerShellRef}
+          className={
+            expandedView
+              ? `fixed inset-0 z-[100] grid h-[100dvh] w-screen gap-0 bg-black sm:gap-3 sm:p-3 ${
+                  fullscreenChatVisible
+                    ? "grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(220px,40vh)] sm:grid-cols-[minmax(0,1fr)_minmax(280px,34vw)] sm:grid-rows-1"
+                    : "grid-cols-1 grid-rows-1"
+                }`
+              : "flex min-w-0 flex-col gap-4"
+          }
+        >
+          <div className={expandedView ? "relative flex min-h-0 min-w-0 items-center justify-center" : "relative"}>
+            <VideoPlayer
+              ref={playerRef}
+              className={expandedView ? "h-full max-h-full w-full aspect-auto rounded-none sm:rounded-lg" : undefined}
+              src={isP2PViewer ? null : src}
+              stream={isP2PViewer ? p2p.remoteStream : null}
+              readOnly={isP2PViewer}
+              emptyText={
+                isP2PViewer
+                  ? "Подключаемся к прямой трансляции владельца…"
+                  : currentSource?.kind === "p2p"
+                    ? "Восстановите или выберите локальный файл для продолжения трансляции."
+                    : "Выберите видео или вставьте прямую ссылку."
+              }
+              onLoadedMetadata={(duration) => {
+                const source = sourceRef.current
+                if (!source) return
+                const updated = { ...source, duration }
+                sourceRef.current = updated
+                setCurrentSource(updated)
+                queuePersistState(currentState({ source: updated }))
+                const pending = pendingPlaybackRef.current
+                if (pending && source.kind === "url") applyPlayback(pending, true)
+              }}
+              onError={setVideoError}
+              onPlay={() => broadcastPlayerState("play", true)}
+              onPause={() => broadcastPlayerState("pause", false)}
+              onSeeked={() => broadcastPlayerState("seek", Boolean(playerRef.current && !playerRef.current.isPaused()))}
+            />
+
+            <div className="absolute right-3 top-3 z-30 flex items-center gap-2">
+              {expandedView && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  className="gap-2 bg-black/70 text-white shadow-lg hover:bg-black/85 hover:text-white"
+                  onClick={() => setFullscreenChatVisible((visible) => !visible)}
+                  aria-pressed={fullscreenChatVisible}
+                >
+                  {fullscreenChatVisible ? <MessageSquareOff className="h-4 w-4" /> : <MessageSquare className="h-4 w-4" />}
+                  <span className="hidden sm:inline">{fullscreenChatVisible ? "Скрыть чат" : "Показать чат"}</span>
+                </Button>
+              )}
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="gap-2 bg-black/70 text-white shadow-lg hover:bg-black/85 hover:text-white"
+                onClick={toggleExpandedView}
+                aria-label={expandedView ? "Выйти из полноэкранного режима" : "Открыть полноэкранный режим"}
+              >
+                {expandedView ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+                <span className="hidden sm:inline">{expandedView ? "Свернуть" : "Полный экран"}</span>
+              </Button>
+            </div>
+          </div>
+
+          {(!expandedView || fullscreenChatVisible) && (
+            <div
+              className={
+                expandedView
+                  ? "min-h-0 min-w-0 border-t border-white/10 bg-background sm:border-l sm:border-t-0 sm:rounded-lg sm:overflow-hidden"
+                  : "h-[420px] lg:h-[460px]"
+              }
+            >
+              <Chat items={chatItems} myId={channel.myId} onSend={sendChatMessage} />
+            </div>
+          )}
+        </div>
+
+        <div className="lg:sticky lg:top-4 lg:self-start">
           <SourceControls
             onUrl={handleUrl}
             onFile={handleFile}
             onRestore={() => void restoreFileFromHandle(true)}
             canRestore={canRestoreFile}
             hint={hint}
-            showQuality={currentSource?.kind === "p2p" && currentSource.ownerId === channel.myId}
-            qualityPreset={qualityPreset}
-            onQualityPresetChange={setQualityPreset}
-          />
-        </div>
-
-        <div className="h-[420px] lg:h-auto">
-          <Chat
-            items={chatItems}
-            myId={channel.myId}
-            onSend={(text) => {
-              const message = channel.sendChat(text)
-              appendChat(message)
-              void persistRoomMessage(roomId, message).catch((error) => {
-                setPersistenceError(error instanceof Error ? `Сообщение отправлено, но не сохранено: ${error.message}` : "Сообщение не сохранено.")
-              })
-            }}
           />
         </div>
       </div>

@@ -4,7 +4,7 @@ import Hls from "hls.js"
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react"
 import { Play, Volume2, VolumeX } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { calculateCaptureSize } from "@/lib/webrtc-quality"
+import { cn } from "@/lib/utils"
 
 interface CapturableVideoElement extends HTMLVideoElement {
   captureStream?: () => MediaStream
@@ -24,6 +24,7 @@ export interface VideoPlayerHandle {
 }
 
 interface VideoPlayerProps {
+  className?: string
   src?: string | null
   stream?: MediaStream | null
   readOnly?: boolean
@@ -40,12 +41,6 @@ interface PendingSeek {
   expiresAt: number
 }
 
-interface AudioCaptureGraph {
-  context: AudioContext
-  source: MediaElementAudioSourceNode
-  destination: MediaStreamAudioDestinationNode
-}
-
 function clampVideoTime(value: number, duration: number | null): number {
   if (!Number.isFinite(value)) return 0
   const nonNegative = Math.max(0, value)
@@ -54,6 +49,7 @@ function clampVideoTime(value: number, duration: number | null): number {
 
 export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(function VideoPlayer(
   {
+    className,
     src = null,
     stream = null,
     readOnly = false,
@@ -74,7 +70,6 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
   const pendingSeekRef = useRef<PendingSeek | null>(null)
   const captureRef = useRef<MediaStream | null>(null)
   const fallbackCleanupRef = useRef<(() => void) | null>(null)
-  const audioCaptureRef = useRef<AudioCaptureGraph | null>(null)
   const capturePulseRef = useRef(0)
   const [needsGesture, setNeedsGesture] = useState(false)
   const [remoteMuted, setRemoteMuted] = useState(false)
@@ -85,7 +80,6 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
     if (!video.paused) return true
     if (silent) suppressPlayUntilRef.current = Date.now() + 2_000
     try {
-      await audioCaptureRef.current?.context.resume().catch(() => undefined)
       await video.play()
       setNeedsGesture(false)
       return true
@@ -126,55 +120,43 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
   const createFallbackCapture = async (video: HTMLVideoElement): Promise<MediaStream | null> => {
     if (!("captureStream" in HTMLCanvasElement.prototype)) return null
     const canvas = document.createElement("canvas")
-    const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-    const size = calculateCaptureSize(video.videoWidth, video.videoHeight, mobile ? 720 : 1080)
-    canvas.width = size.width
-    canvas.height = size.height
-    const context = canvas.getContext("2d", { alpha: false, desynchronized: true })
+    canvas.width = Math.max(2, video.videoWidth || 1280)
+    canvas.height = Math.max(2, video.videoHeight || 720)
+    const context = canvas.getContext("2d", { alpha: false })
     if (!context) return null
-    const maxFrameRate = 30
-    const minFrameInterval = 1000 / maxFrameRate
-    const canvasStream = canvas.captureStream(maxFrameRate)
+    const canvasStream = canvas.captureStream(30)
     let stopped = false
     let frameRequest = 0
-    let lastDrawAt = 0
 
-    const draw = (now = performance.now()) => {
+    const draw = () => {
       if (stopped) return
-      if (now - lastDrawAt >= minFrameInterval - 2) {
-        lastDrawAt = now
-        try {
-          context.drawImage(video, 0, 0, canvas.width, canvas.height)
-        } catch {
-          // The next decoded frame can recover.
-        }
+      try {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      } catch {
+        // The next frame can recover.
       }
       const callback = (video as HTMLVideoElement & {
-        requestVideoFrameCallback?: (callback: (now: number) => void) => number
+        requestVideoFrameCallback?: (callback: () => void) => number
       }).requestVideoFrameCallback
       if (callback) frameRequest = callback.call(video, draw)
       else frameRequest = window.requestAnimationFrame(draw)
     }
     draw()
 
+    let audioContext: AudioContext | null = null
     try {
       const AudioContextCtor = window.AudioContext
       if (AudioContextCtor) {
-        let graph = audioCaptureRef.current
-        if (!graph || graph.context.state === "closed") {
-          const context = new AudioContextCtor()
-          const source = context.createMediaElementSource(video)
-          const destination = context.createMediaStreamDestination()
-          source.connect(destination)
-          source.connect(context.destination)
-          graph = { context, source, destination }
-          audioCaptureRef.current = graph
-        }
-        await graph.context.resume().catch(() => undefined)
-        for (const track of graph.destination.stream.getAudioTracks()) canvasStream.addTrack(track.clone())
+        audioContext = new AudioContextCtor()
+        const sourceNode = audioContext.createMediaElementSource(video)
+        const destination = audioContext.createMediaStreamDestination()
+        sourceNode.connect(destination)
+        sourceNode.connect(audioContext.destination)
+        await audioContext.resume().catch(() => undefined)
+        for (const track of destination.stream.getAudioTracks()) canvasStream.addTrack(track)
       }
     } catch {
-      // Video-only fallback remains useful when Web Audio is unavailable.
+      // Video-only fallback remains useful.
     }
 
     fallbackCleanupRef.current = () => {
@@ -185,6 +167,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
       if (cancelVideoFrame && frameRequest) cancelVideoFrame.call(video, frameRequest)
       else if (frameRequest) window.cancelAnimationFrame(frameRequest)
       canvasStream.getTracks().forEach((track) => track.stop())
+      void audioContext?.close()
     }
     return canvasStream
   }
@@ -307,14 +290,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
     if (video && stream) video.muted = remoteMuted
   }, [remoteMuted, stream])
 
-  useEffect(() => () => {
-    stopCapture()
-    const graph = audioCaptureRef.current
-    audioCaptureRef.current = null
-    graph?.source.disconnect()
-    graph?.destination.disconnect?.()
-    void graph?.context.close()
-  }, [])
+  useEffect(() => () => stopCapture(), [])
 
   const handleGesture = async () => {
     const started = await play(false)
@@ -324,11 +300,12 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(funct
   const hasMedia = Boolean(src || stream)
 
   return (
-    <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black">
+    <div className={cn("relative aspect-video w-full overflow-hidden rounded-lg bg-black", className)}>
       <video
         ref={videoRef}
-        className="h-full w-full"
+        className="h-full w-full object-contain"
         controls={hasMedia && !readOnly}
+        controlsList="nofullscreen"
         playsInline
         preload="metadata"
         onPlay={() => {
