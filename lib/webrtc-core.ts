@@ -14,11 +14,31 @@ export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 
 export function parseIceServers(value?: string): RTCIceServer[] {
   if (!value?.trim()) return DEFAULT_ICE_SERVERS
+
+  // Accept the standard JSON form so TURN credentials survive deployment:
+  // [{"urls":["turn:turn.example:3478"],"username":"...","credential":"..."}]
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (Array.isArray(parsed)) {
+      const servers = parsed.filter((server): server is RTCIceServer => {
+        if (!server || typeof server !== "object") return false
+        const candidate = server as { urls?: unknown; username?: unknown; credential?: unknown }
+        const urls = Array.isArray(candidate.urls) ? candidate.urls : [candidate.urls]
+        return urls.some((url) => typeof url === "string" && /^(stun|turn|turns):/i.test(url))
+          && (candidate.username === undefined || typeof candidate.username === "string")
+          && (candidate.credential === undefined || typeof candidate.credential === "string")
+      })
+      if (servers.length > 0) return servers
+    }
+  } catch {
+    // Also support the simple comma-separated URL format below.
+  }
+
   const urls = value
-    .split(",")
+    .split(/[;,\\n]/)
     .map((url) => url.trim())
-    .filter((url) => url.startsWith("stun:") || url.startsWith("turn:") || url.startsWith("turns:"))
-  return urls.length > 0 ? urls.map((urls) => ({ urls })) : DEFAULT_ICE_SERVERS
+    .filter((url) => /^(stun|turn|turns):/i.test(url))
+  return urls.length > 0 ? urls.map((url) => ({ urls: url })) : DEFAULT_ICE_SERVERS
 }
 
 export function configureMovieCodecs(connection: RTCPeerConnection): string[] {
