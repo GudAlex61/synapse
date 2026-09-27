@@ -10,6 +10,17 @@ export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  // Best-effort relay fallback for restrictive NATs and VPNs. Production
+  // deployments should override this with private, rotating TURN credentials.
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:443",
+      "turns:openrelay.metered.ca:443",
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ]
 
 export function parseIceServers(value?: string): RTCIceServer[] {
@@ -35,7 +46,7 @@ export function parseIceServers(value?: string): RTCIceServer[] {
   }
 
   const urls = value
-    .split(/[;,\\n]/)
+    .split(/[;,\n]/)
     .map((url) => url.trim())
     .filter((url) => /^(stun|turn|turns):/i.test(url))
   return urls.length > 0 ? urls.map((url) => ({ urls: url })) : DEFAULT_ICE_SERVERS
